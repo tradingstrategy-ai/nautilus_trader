@@ -113,7 +113,7 @@ class AsterDataClientConfig(LiveDataClientConfig, frozen=True):
     api_key: str | None = None
     api_secret: str | None = None
     key_type: AsterKeyType = AsterKeyType.HMAC
-    account_type: AsterAccountType = AsterAccountType.SPOT
+    account_type: AsterAccountType = AsterAccountType.USDT_FUTURES  # Aster is futures-only
     base_url_http: str | None = None
     base_url_ws: str | None = None
     proxy_url: str | None = None
@@ -158,9 +158,9 @@ class AsterExecClientConfig(LiveExecClientConfig, frozen=True):
         If client is connecting to Aster US.
     testnet : bool, default False
         Deprecated: use ``environment`` instead.
-    use_gtd : bool, default True
+    use_gtd : bool, default False
         If GTD orders will use the Aster GTD TIF option.
-        If False, then GTD time in force will be remapped to GTC (this is useful if managing GTD orders locally).
+        Aster does NOT support GTD, so this defaults to False (GTD remapped to GTC).
     use_reduce_only : bool, default True
         If the `reduce_only` execution instruction on orders is sent through to the exchange.
         If True, then will assign the value on orders sent to the exchange, otherwise will always be False.
@@ -200,7 +200,7 @@ class AsterExecClientConfig(LiveExecClientConfig, frozen=True):
     api_key: str | None = None
     api_secret: str | None = None
     key_type: AsterKeyType = AsterKeyType.HMAC
-    account_type: AsterAccountType = AsterAccountType.SPOT
+    account_type: AsterAccountType = AsterAccountType.USDT_FUTURES  # Aster is futures-only
     base_url_http: str | None = None
     base_url_ws: str | None = None
     base_url_ws_stream: str | None = None
@@ -208,7 +208,7 @@ class AsterExecClientConfig(LiveExecClientConfig, frozen=True):
     environment: AsterEnvironment | None = None
     us: bool = False
     testnet: bool = False
-    use_gtd: bool = True
+    use_gtd: bool = False  # Aster does not support GTD
     use_reduce_only: bool = True
     use_position_ids: bool = True
     use_trade_lite: bool = False

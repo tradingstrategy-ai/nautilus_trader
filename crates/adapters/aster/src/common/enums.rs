@@ -386,9 +386,14 @@ pub enum AsterTimeInForce {
     /// Good till crossing (post-only).
     Gtx,
     /// Good till date.
+    /// NOTE: Aster does not support GTD. Kept for deserialization compatibility;
+    /// the Python config sets `use_gtd=False` to prevent submission.
     Gtd,
     /// Request-for-quote interactive (USD-M Futures).
     Rpi,
+    /// Aster-specific: order not visible in order book.
+    #[serde(rename = "HIDDEN")]
+    Hidden,
     /// Unknown or undocumented value.
     #[serde(other)]
     Unknown,

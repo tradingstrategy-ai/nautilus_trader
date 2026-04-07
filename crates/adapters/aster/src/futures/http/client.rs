@@ -2369,20 +2369,14 @@ impl AsterFuturesHttpClient {
     }
 }
 
-/// Checks if an order type requires the Aster Algo Service API.
+/// Checks if an order type requires the Algo Service API.
 ///
-/// As of 2025-12-09, Aster migrated conditional order types to the Algo Service API.
-/// The traditional `/fapi/v1/order` endpoint returns error `-4120` for these types.
+/// Aster does NOT support the `/fapi/v1/algo` endpoint (returns 404).
+/// All conditional orders (stop, take-profit, trailing stop) go through
+/// the regular `/fapi/v1/order` endpoint. Always returns `false`.
 #[must_use]
-pub fn is_algo_order_type(order_type: OrderType) -> bool {
-    matches!(
-        order_type,
-        OrderType::StopMarket
-            | OrderType::StopLimit
-            | OrderType::MarketIfTouched
-            | OrderType::LimitIfTouched
-            | OrderType::TrailingStopMarket
-    )
+pub fn is_algo_order_type(_order_type: OrderType) -> bool {
+    false
 }
 
 /// Converts a Nautilus order type to a Aster Futures order type.

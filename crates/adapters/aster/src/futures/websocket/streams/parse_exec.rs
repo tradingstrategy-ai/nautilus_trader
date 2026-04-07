@@ -392,7 +392,9 @@ fn parse_futures_order_type(order_type: AsterFuturesOrderType) -> OrderType {
 
 fn parse_time_in_force(tif: AsterTimeInForce) -> TimeInForce {
     match tif {
-        AsterTimeInForce::Gtc | AsterTimeInForce::Gtx => TimeInForce::Gtc,
+        AsterTimeInForce::Gtc | AsterTimeInForce::Gtx | AsterTimeInForce::Hidden => {
+            TimeInForce::Gtc
+        }
         AsterTimeInForce::Ioc | AsterTimeInForce::Rpi => TimeInForce::Ioc,
         AsterTimeInForce::Fok => TimeInForce::Fok,
         AsterTimeInForce::Gtd => TimeInForce::Gtd,

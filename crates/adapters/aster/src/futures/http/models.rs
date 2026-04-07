@@ -1024,6 +1024,7 @@ impl AsterTimeInForce {
             Self::Gtx => TimeInForce::Gtc, // GTX is GTC with post-only
             Self::Gtd => TimeInForce::Gtd,
             Self::Rpi => TimeInForce::Ioc, // RPI behaves as immediate
+            Self::Hidden => TimeInForce::Gtc, // Hidden: not visible in book
             Self::Unknown => TimeInForce::Gtc, // default
         }
     }

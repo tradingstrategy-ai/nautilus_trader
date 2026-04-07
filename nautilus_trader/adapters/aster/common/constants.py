@@ -75,13 +75,6 @@ ASTER_PRICE_MATCH_ORDER_TYPES: Final[frozenset[OrderType]] = frozenset(
     },
 )
 
-# Conditional order types that require the Algo Order API for Aster Futures (as of 2025-12-09)
-ASTER_FUTURES_ALGO_ORDER_TYPES: Final[frozenset[OrderType]] = frozenset(
-    {
-        OrderType.STOP_MARKET,
-        OrderType.STOP_LIMIT,
-        OrderType.MARKET_IF_TOUCHED,
-        OrderType.LIMIT_IF_TOUCHED,
-        OrderType.TRAILING_STOP_MARKET,
-    },
-)
+# Aster does NOT have an Algo Order API (/fapi/v1/algo returns 404).
+# All conditional orders go through the standard /fapi/v1/order endpoint.
+ASTER_FUTURES_ALGO_ORDER_TYPES: Final[frozenset[OrderType]] = frozenset()

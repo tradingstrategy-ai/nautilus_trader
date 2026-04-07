@@ -258,8 +258,9 @@ class AsterTimeInForce(Enum):
     IOC = "IOC"
     FOK = "FOK"
     GTX = "GTX"  # FUTURES only, Good Till Crossing (Post Only)
-    GTD = "GTD"  # FUTURES only
+    GTD = "GTD"  # FUTURES only — Aster does NOT support GTD; kept for compatibility
     GTE_GTC = "GTE_GTC"  # Undocumented
+    HIDDEN = "HIDDEN"  # Aster-specific: order not visible in order book
 
 
 @unique

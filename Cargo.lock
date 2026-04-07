@@ -5047,6 +5047,54 @@ dependencies = [
 ]
 
 [[package]]
+name = "nautilus-aster"
+version = "0.55.0"
+dependencies = [
+ "ahash 0.8.12",
+ "anyhow",
+ "arc-swap",
+ "async-stream",
+ "async-trait",
+ "aws-lc-rs",
+ "axum",
+ "base64",
+ "bon",
+ "chrono",
+ "criterion",
+ "dashmap",
+ "derive_builder",
+ "dotenvy",
+ "ed25519-dalek",
+ "futures-util",
+ "log",
+ "nautilus-common",
+ "nautilus-core",
+ "nautilus-live",
+ "nautilus-model",
+ "nautilus-network",
+ "nautilus-serialization",
+ "nautilus-system",
+ "nautilus-testkit",
+ "nautilus-trading",
+ "pyo3",
+ "pyo3-async-runtimes",
+ "pyo3-stub-gen",
+ "rstest",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite 0.29.0",
+ "tokio-util",
+ "url",
+ "ustr",
+ "zeroize",
+]
+
+[[package]]
 name = "nautilus-backtest"
 version = "0.55.0"
 dependencies = [
