@@ -37,7 +37,7 @@ use crate::common::enums::{AsterEnvironment, AsterMarginType, AsterProductType};
 )]
 pub struct AsterDataClientConfig {
     /// Product types to subscribe to.
-    #[builder(default = vec![AsterProductType::Spot])]
+    #[builder(default = vec![AsterProductType::UsdM])]  // Aster is futures-only
     pub product_types: Vec<AsterProductType>,
     /// Environment (mainnet or testnet).
     #[builder(default = AsterEnvironment::Mainnet)]
@@ -90,7 +90,7 @@ pub struct AsterExecClientConfig {
     #[builder(default = AccountId::from("ASTER-001"))]
     pub account_id: AccountId,
     /// Product types to trade.
-    #[builder(default = vec![AsterProductType::Spot])]
+    #[builder(default = vec![AsterProductType::UsdM])]  // Aster is futures-only
     pub product_types: Vec<AsterProductType>,
     /// Environment (mainnet or testnet).
     #[builder(default = AsterEnvironment::Mainnet)]

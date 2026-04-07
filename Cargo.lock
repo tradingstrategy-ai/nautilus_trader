@@ -6081,6 +6081,7 @@ version = "0.55.0"
 dependencies = [
  "nautilus-analysis",
  "nautilus-architect-ax",
+ "nautilus-aster",
  "nautilus-backtest",
  "nautilus-binance",
  "nautilus-bitmex",

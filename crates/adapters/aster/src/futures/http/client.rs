@@ -1587,6 +1587,10 @@ impl AsterFuturesHttpClient {
         post_only: bool,
         position_side: Option<AsterPositionSide>,
         price_match: Option<AsterPriceMatch>,
+        // Aster routes trailing stop params through regular order API (no algo endpoint)
+        activation_price: Option<Price>,
+        callback_rate: Option<String>,
+        working_type: Option<AsterWorkingType>,
     ) -> anyhow::Result<OrderStatusReport> {
         let symbol = format_aster_symbol(&instrument_id);
         let size_precision = self.get_size_precision(&symbol)?;
@@ -1643,9 +1647,9 @@ impl AsterFuturesHttpClient {
             reduce_only: if reduce_only { Some(true) } else { None },
             position_side,
             close_position: None,
-            activation_price: None,
-            callback_rate: None,
-            working_type: None,
+            activation_price: activation_price.map(|p| p.to_string()),
+            callback_rate,
+            working_type,
             price_protect: None,
             new_order_resp_type: None,
             good_till_date: None,

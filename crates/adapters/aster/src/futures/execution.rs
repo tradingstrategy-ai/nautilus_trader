@@ -611,6 +611,8 @@ impl AsterFuturesExecutionClient {
                     )
                     .await
             } else {
+                // Aster has no algo endpoint — all orders including trailing stops
+                // go through the regular order API
                 http_client
                     .submit_order(
                         account_id,
@@ -626,6 +628,9 @@ impl AsterFuturesExecutionClient {
                         post_only,
                         position_side,
                         price_match,
+                        activation_price,
+                        callback_rate,
+                        working_type,
                     )
                     .await
             };

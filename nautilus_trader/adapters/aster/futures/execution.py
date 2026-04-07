@@ -20,7 +20,6 @@ from decimal import Decimal
 import msgspec
 
 from nautilus_trader.accounting.accounts.margin import MarginAccount
-from nautilus_trader.adapters.aster.common.constants import ASTER_FUTURES_ALGO_ORDER_TYPES
 from nautilus_trader.adapters.aster.common.enums import AsterAccountType
 from nautilus_trader.adapters.aster.common.enums import AsterEnvironment
 from nautilus_trader.adapters.aster.common.enums import AsterErrorCode
@@ -50,7 +49,6 @@ from nautilus_trader.common.component import MessageBus
 from nautilus_trader.common.enums import LogColor
 from nautilus_trader.core.correctness import PyCondition
 from nautilus_trader.core.datetime import millis_to_nanos
-from nautilus_trader.core.datetime import secs_to_millis
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import BatchCancelOrders
 from nautilus_trader.execution.messages import CancelAllOrders
@@ -62,7 +60,6 @@ from nautilus_trader.execution.reports import PositionStatusReport
 from nautilus_trader.model.enums import OrderType
 from nautilus_trader.model.enums import order_type_to_str
 from nautilus_trader.model.enums import time_in_force_to_str
-from nautilus_trader.model.identifiers import ClientOrderId
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.orders import Order
 
@@ -296,70 +293,20 @@ class AsterFuturesExecutionClient(AsterCommonExecutionClient):
         self,
         command: GenerateOrderStatusReport,
     ) -> OrderStatusReport | None:
-        report = await super().generate_order_status_report(command)
-        if report is not None:
-            return report
-
-        client_order_id = command.client_order_id.value if command.client_order_id else None
-        venue_order_id = int(command.venue_order_id.value) if command.venue_order_id else None
-
-        if client_order_id is None and venue_order_id is None:
-            return None
-
-        try:
-            algo_order = await self._futures_http_account.query_algo_order(
-                algo_id=venue_order_id,
-                client_algo_id=client_order_id,
-            )
-        except AsterError as e:
-            self._log.debug(f"Algo order query also failed: {e.message}")
-            return None
-
-        if algo_order is None:
-            return None
-
-        try:
-            report = algo_order.parse_to_order_status_report(
-                account_id=self.account_id,
-                instrument_id=self._get_cached_instrument_id(algo_order.symbol),
-                report_id=UUID4(),
-                enum_parser=self._futures_enum_parser,
-                ts_init=self._clock.timestamp_ns(),
-            )
-        except ValueError as e:
-            self._log.warning(f"Cannot parse algo order: {e}")
-            return None
-
-        self._log.debug(f"Received algo {report}")
-        return report
+        # Aster DEX does not support algo orders (/fapi/v1/algo returns 404).
+        # All conditional orders go through the standard /fapi/v1/order endpoint,
+        # so the base class implementation is sufficient.
+        return await super().generate_order_status_report(command)
 
     async def generate_order_status_reports(
         self,
         command: GenerateOrderStatusReports,
     ) -> list[OrderStatusReport]:
+        # Aster DEX does not support algo orders (/fapi/v1/algo returns 404).
+        # All conditional orders go through the standard /fapi/v1/order endpoint,
+        # so we skip the algo order report fetching entirely.
         reports = await super().generate_order_status_reports(command)
-
-        # Reuses cached result from base class call above
-        symbol = command.instrument_id.symbol.value if command.instrument_id is not None else None
-        active_symbols, _ = await self._build_active_symbols(symbol)
-
-        start_ms = secs_to_millis(command.start.timestamp()) if command.start else None
-        end_ms = secs_to_millis(command.end.timestamp()) if command.end else None
-
-        try:
-            algo_reports = await self._generate_algo_order_status_reports(
-                symbol=symbol,
-                active_symbols=active_symbols,
-                open_only=command.open_only,
-                start_ms=start_ms,
-                end_ms=end_ms,
-            )
-            reports.extend(algo_reports)
-        except AsterError as e:
-            self._log.warning(f"Cannot generate algo OrderStatusReports: {e.message}")
-        finally:
-            self._active_symbols_cache = None
-
+        self._active_symbols_cache = None
         return reports
 
     async def _generate_algo_order_status_reports(
@@ -370,47 +317,17 @@ class AsterFuturesExecutionClient(AsterCommonExecutionClient):
         start_ms: int | None,
         end_ms: int | None,
     ) -> list[OrderStatusReport]:
-        algo_orders, seen_algo_ids = await self._fetch_algo_orders(symbol)
-        self._log.debug(f"Fetched {len(algo_orders)} open algo orders")
-
-        # For historical mode, also fetch from allAlgoOrders (limited to 7 days by Aster)
-        if not open_only:
-            for active_symbol in active_symbols:
-                response = await self._futures_http_account.query_all_algo_orders(
-                    symbol=active_symbol,
-                    start_time=start_ms,
-                    end_time=end_ms,
-                    limit=1000,
-                )
-                # Deduplicate - open orders may appear in both endpoints
-                for order in response:
-                    if order.algoId not in seen_algo_ids:
-                        algo_orders.append(order)
-                        seen_algo_ids.add(order.algoId)
-            self._log.debug(f"Total {len(algo_orders)} algo orders after historical merge")
-
-        reports: list[OrderStatusReport] = []
-        for algo_order in algo_orders:
-            report = self._parse_algo_order_report(algo_order, start_ms, end_ms)
-            if report is not None:
-                reports.append(report)
-
-        return reports
+        # Aster DEX does not support algo orders (/fapi/v1/algo returns 404).
+        # All conditional orders go through the standard /fapi/v1/order endpoint.
+        return []
 
     async def _fetch_algo_orders(
         self,
         symbol: str | None,
     ) -> tuple[list[AsterFuturesAlgoOrder], set[int]]:
-        algo_orders: list[AsterFuturesAlgoOrder] = []
-        seen_algo_ids: set[int] = set()
-
-        # The openAlgoOrders endpoint has no time limit, unlike allAlgoOrders (7-day limit)
-        open_orders = await self._futures_http_account.query_open_algo_orders(symbol)
-        for order in open_orders:
-            algo_orders.append(order)
-            seen_algo_ids.add(order.algoId)
-
-        return algo_orders, seen_algo_ids
+        # Aster DEX does not support algo orders (/fapi/v1/algo returns 404).
+        # All conditional orders go through the standard /fapi/v1/order endpoint.
+        return [], set()
 
     def _parse_algo_order_report(
         self,
@@ -418,36 +335,9 @@ class AsterFuturesExecutionClient(AsterCommonExecutionClient):
         start_ms: int | None,
         end_ms: int | None,
     ) -> OrderStatusReport | None:
-        if start_ms is not None and algo_order.createTime < start_ms:
-            return None
-        if end_ms is not None and algo_order.createTime > end_ms:
-            return None
-
-        # Skip triggered algo orders - the regular orders API provides accurate
-        # fill data for these
-        if algo_order.actualOrderId:
-            if algo_order.clientAlgoId:
-                self._triggered_algo_order_ids.add(ClientOrderId(algo_order.clientAlgoId))
-            self._log.debug(
-                f"Skipping triggered algo order {algo_order.clientAlgoId} "
-                f"(actualOrderId={algo_order.actualOrderId}) - using regular order data",
-            )
-            return None
-
-        try:
-            report = algo_order.parse_to_order_status_report(
-                account_id=self.account_id,
-                instrument_id=self._get_cached_instrument_id(algo_order.symbol),
-                report_id=UUID4(),
-                enum_parser=self._futures_enum_parser,
-                ts_init=self._clock.timestamp_ns(),
-            )
-        except ValueError as e:
-            self._log.warning(f"Skipping algo order during reconciliation: {e}")
-            return None
-
-        self._log.debug(f"Received algo {report}")
-        return report
+        # Aster DEX does not support algo orders (/fapi/v1/algo returns 404).
+        # All conditional orders go through the standard /fapi/v1/order endpoint.
+        return None
 
     def _check_order_validity(self, order: Order) -> str | None:
         # Check order type valid
@@ -504,48 +394,32 @@ class AsterFuturesExecutionClient(AsterCommonExecutionClient):
         if not orders:
             return
 
-        # Split into algo orders (need individual cancel) vs regular orders (can batch)
-        algo_orders: list[Order] = []
-        regular_orders: list[Order] = []
+        # Aster DEX does not support algo orders (/fapi/v1/algo returns 404).
+        # All conditional orders go through the standard /fapi/v1/order endpoint,
+        # so we treat all orders as regular orders for cancellation.
+        cancels = [
+            CancelOrder(
+                trader_id=command.trader_id,
+                strategy_id=command.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                venue_order_id=order.venue_order_id,
+                command_id=UUID4(),
+                ts_init=command.ts_init,
+            )
+            for order in orders
+        ]
 
-        for order in orders:
-            if order.order_type in ASTER_FUTURES_ALGO_ORDER_TYPES:
-                # Triggered algo orders become regular orders
-                if order.client_order_id in self._triggered_algo_order_ids:
-                    regular_orders.append(order)
-                else:
-                    algo_orders.append(order)
-            else:
-                regular_orders.append(order)
-
-        # Algo orders must use individual cancel (routes to algo endpoint via _cancel_order_single)
-        if algo_orders:
-            await self._cancel_orders_individual(algo_orders)
-
-        if regular_orders:
-            cancels = [
-                CancelOrder(
-                    trader_id=command.trader_id,
-                    strategy_id=command.strategy_id,
-                    instrument_id=order.instrument_id,
-                    client_order_id=order.client_order_id,
-                    venue_order_id=order.venue_order_id,
-                    command_id=UUID4(),
-                    ts_init=command.ts_init,
-                )
-                for order in regular_orders
-            ]
-
-            valid_cancels = self._filter_valid_cancels(cancels)
-            if valid_cancels:
-                successful_cancels, failed_cancels = await self._process_cancel_batches(
-                    valid_cancels,
-                    command.instrument_id.symbol.value,
-                )
-                self._log.info(
-                    f"Strategy cancel completed: {len(successful_cancels)} successful, "
-                    f"{len(failed_cancels)} failed out of {len(valid_cancels)} valid orders",
-                )
+        valid_cancels = self._filter_valid_cancels(cancels)
+        if valid_cancels:
+            successful_cancels, failed_cancels = await self._process_cancel_batches(
+                valid_cancels,
+                command.instrument_id.symbol.value,
+            )
+            self._log.info(
+                f"Strategy cancel completed: {len(successful_cancels)} successful, "
+                f"{len(failed_cancels)} failed out of {len(valid_cancels)} valid orders",
+            )
 
     def _filter_valid_cancels(self, cancels: list[CancelOrder]) -> list[CancelOrder]:
         # Filter out orders that are already closed or not found
@@ -690,11 +564,7 @@ class AsterFuturesExecutionClient(AsterCommonExecutionClient):
         order_data.handle_order_trade_update(self)
 
     def _handle_algo_update(self, raw: bytes) -> None:
-        algo_update = self._decoder_futures_algo_update.decode(raw)
-        order_data = algo_update.o
-        self._log.debug(
-            f"ALGO_UPDATE received: caid={order_data.caid}, aid={order_data.aid}, "
-            f"status={order_data.X}, symbol={order_data.s}",
-        )
-        ts_event = millis_to_nanos(algo_update.T)
-        order_data.handle_algo_update(self, ts_event)
+        # Aster DEX does not support algo orders (/fapi/v1/algo returns 404).
+        # All conditional orders go through the standard /fapi/v1/order endpoint.
+        # This handler is kept as a no-op for interface compatibility.
+        self._log.warning("Aster does not support algo orders — ignoring ALGO_UPDATE event")

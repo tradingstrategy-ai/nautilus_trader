@@ -13,7 +13,7 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 """
-Aster cryptocurreny exchange integration adapter.
+Aster DEX exchange integration adapter (futures-only).
 
 This subpackage provides an instrument provider, data and execution clients,
 configurations, data types and constants for connecting to and interacting with
@@ -44,15 +44,12 @@ from nautilus_trader.adapters.aster.factories import AsterLiveExecClientFactory
 from nautilus_trader.adapters.aster.factories import get_cached_aster_http_client
 from nautilus_trader.adapters.aster.futures.providers import AsterFuturesInstrumentProvider
 from nautilus_trader.adapters.aster.futures.types import AsterFuturesMarkPriceUpdate
-from nautilus_trader.adapters.aster.loaders import AsterOrderBookDeltaDataLoader
-from nautilus_trader.adapters.aster.spot.providers import AsterSpotInstrumentProvider
 from nautilus_trader.core import nautilus_pyo3
 from nautilus_trader.serialization import register_serializable_type
 from nautilus_trader.serialization.arrow.schema import NAUTILUS_ARROW_SCHEMA
 from nautilus_trader.serialization.arrow.serializer import make_dict_deserializer
 from nautilus_trader.serialization.arrow.serializer import make_dict_serializer
 from nautilus_trader.serialization.arrow.serializer import register_arrow
-from nautilus_trader.serialization.arrow.serializer import register_rust_custom_serializer
 
 
 register_serializable_type(
@@ -69,18 +66,6 @@ register_serializable_type(
 
 
 _aster_mod = nautilus_pyo3.aster  # type: ignore[attr-defined]
-
-
-def _convert_aster_bar_to_pyo3(bar: AsterBar) -> object:
-    return _aster_mod.AsterBar.from_dict(AsterBar.to_dict(bar))
-
-
-register_rust_custom_serializer(
-    "AsterBar",
-    _aster_mod.aster_bar_to_arrow_record_batch_bytes,
-    _convert_aster_bar_to_pyo3,
-    data_cls=AsterBar,
-)
 
 
 ASTER_FUTURES_MARK_PRICE_UPDATE_ARROW_SCHEMA: Final[pa.schema] = pa.schema(
@@ -107,7 +92,6 @@ register_arrow(
     decoder=make_dict_deserializer(AsterFuturesMarkPriceUpdate),
 )
 
-decode_aster_spot_client_order_id = nautilus_pyo3.aster.decode_aster_spot_client_order_id  # type: ignore[attr-defined]
 decode_aster_futures_client_order_id = (
     nautilus_pyo3.aster.decode_aster_futures_client_order_id  # type: ignore[attr-defined]
 )
@@ -125,9 +109,6 @@ __all__ = [
     "AsterKeyType",
     "AsterLiveDataClientFactory",
     "AsterLiveExecClientFactory",
-    "AsterOrderBookDeltaDataLoader",
-    "AsterSpotInstrumentProvider",
     "decode_aster_futures_client_order_id",
-    "decode_aster_spot_client_order_id",
     "get_cached_aster_http_client",
 ]

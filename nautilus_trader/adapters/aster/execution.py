@@ -18,7 +18,6 @@ from collections.abc import Awaitable
 from collections.abc import Callable
 from decimal import Decimal
 
-from nautilus_trader.adapters.aster.common.constants import ASTER_FUTURES_ALGO_ORDER_TYPES
 from nautilus_trader.adapters.aster.common.constants import ASTER_MAX_CALLBACK_RATE
 from nautilus_trader.adapters.aster.common.constants import ASTER_MIN_CALLBACK_RATE
 from nautilus_trader.adapters.aster.common.constants import ASTER_PRICE_MATCH_ORDER_TYPES
@@ -273,6 +272,8 @@ class AsterCommonExecutionClient(LiveExecutionClient):
         self._instrument_ids: dict[str, InstrumentId] = {}
         self._active_symbols_cache: tuple[str | None, set[str], list[AsterOrder]] | None = None
         self._generate_order_status_retries: dict[ClientOrderId, int] = {}
+        # Aster DEX does not support algo orders (/fapi/v1/algo returns 404).
+        # This set is kept empty for interface compatibility but is never populated.
         self._triggered_algo_order_ids: set[ClientOrderId] = set()
 
         self._retry_manager_pool = RetryManagerPool[None](
@@ -1048,19 +1049,19 @@ class AsterCommonExecutionClient(LiveExecutionClient):
         time_in_force = self._determine_time_in_force(order)
 
         if self._aster_account_type.is_futures:
-            await self._http_account.new_algo_order(  # type: ignore [attr-defined]
+            await self._http_account.new_order(  # type: ignore [attr-defined]
                 symbol=order.instrument_id.symbol.value,
                 side=self._enum_parser.parse_internal_order_side(order.side),
                 order_type=self._enum_parser.parse_internal_order_type(order),
                 position_side=position_side,
                 quantity=str(order.quantity),
                 price=None if price_match else str(order.price),
-                trigger_price=str(order.trigger_price),
+                stop_price=str(order.trigger_price),
                 time_in_force=time_in_force,
                 working_type=working_type,
                 price_match=price_match,
                 reduce_only=self._determine_reduce_only_str(order),
-                client_algo_id=order.client_order_id.value,
+                new_client_order_id=order.client_order_id.value,
                 good_till_date=self._determine_good_till_date(order, time_in_force),
                 recv_window=str(self._recv_window),
             )
@@ -1127,31 +1128,31 @@ class AsterCommonExecutionClient(LiveExecutionClient):
         if self._aster_account_type.is_futures:
             if close_position:
                 # closePosition is mutually exclusive with quantity and reduceOnly
-                await self._http_account.new_algo_order(  # type: ignore [attr-defined]
+                await self._http_account.new_order(  # type: ignore [attr-defined]
                     symbol=order.instrument_id.symbol.value,
                     side=self._enum_parser.parse_internal_order_side(order.side),
                     order_type=self._enum_parser.parse_internal_order_type(order),
                     position_side=position_side,
                     close_position="true",
-                    trigger_price=str(order.trigger_price),
+                    stop_price=str(order.trigger_price),
                     time_in_force=time_in_force,
                     working_type=working_type,
-                    client_algo_id=order.client_order_id.value,
+                    new_client_order_id=order.client_order_id.value,
                     good_till_date=self._determine_good_till_date(order, time_in_force),
                     recv_window=str(self._recv_window),
                 )
             else:
-                await self._http_account.new_algo_order(  # type: ignore [attr-defined]
+                await self._http_account.new_order(  # type: ignore [attr-defined]
                     symbol=order.instrument_id.symbol.value,
                     side=self._enum_parser.parse_internal_order_side(order.side),
                     order_type=self._enum_parser.parse_internal_order_type(order),
                     position_side=position_side,
                     quantity=str(order.quantity),
-                    trigger_price=str(order.trigger_price),
+                    stop_price=str(order.trigger_price),
                     time_in_force=time_in_force,
                     working_type=working_type,
                     reduce_only=self._determine_reduce_only_str(order),
-                    client_algo_id=order.client_order_id.value,
+                    new_client_order_id=order.client_order_id.value,
                     good_till_date=self._determine_good_till_date(order, time_in_force),
                     recv_window=str(self._recv_window),
                 )
@@ -1198,7 +1199,7 @@ class AsterCommonExecutionClient(LiveExecutionClient):
         activation_price: Price | None = order.activation_price
 
         # TRAILING_STOP_MARKET is a futures-only order type
-        await self._http_account.new_algo_order(  # type: ignore [attr-defined]
+        await self._http_account.new_order(  # type: ignore [attr-defined]
             symbol=order.instrument_id.symbol.value,
             side=self._enum_parser.parse_internal_order_side(order.side),
             order_type=self._enum_parser.parse_internal_order_type(order),
@@ -1209,7 +1210,7 @@ class AsterCommonExecutionClient(LiveExecutionClient):
             time_in_force=time_in_force,
             working_type=working_type,
             reduce_only=self._determine_reduce_only_str(order),
-            client_algo_id=order.client_order_id.value,
+            new_client_order_id=order.client_order_id.value,
             good_till_date=self._determine_good_till_date(order, time_in_force),
             recv_window=str(self._recv_window),
         )
@@ -1255,15 +1256,11 @@ class AsterCommonExecutionClient(LiveExecutionClient):
             return
 
         # Check if order can be modified via regular endpoint
-        # - LIMIT orders can always be modified
-        # - Triggered STOP_LIMIT/LIMIT_IF_TOUCHED become LIMIT orders in matching engine
+        # Aster DEX does not support algo orders — all conditional orders go through
+        # the standard /fapi/v1/order endpoint, so only LIMIT orders can be modified.
         is_limit = order.order_type == OrderType.LIMIT
-        is_triggered_limit_algo = (
-            order.order_type in (OrderType.STOP_LIMIT, OrderType.LIMIT_IF_TOUCHED)
-            and command.client_order_id in self._triggered_algo_order_ids
-        )
 
-        if not is_limit and not is_triggered_limit_algo:
+        if not is_limit:
             reason = f"only LIMIT orders supported by the venue (was {order.type_string()})"
             self._log.error(f"Cannot modify order: {reason}")
             self.generate_order_modify_rejected(
@@ -1368,38 +1365,9 @@ class AsterCommonExecutionClient(LiveExecutionClient):
         instrument_id: InstrumentId,
         orders: list[Order],
     ) -> None:
-        retry_manager = await self._retry_manager_pool.acquire()
-        try:
-            await retry_manager.run(
-                "cancel_all_open_algo_orders",
-                [instrument_id],
-                self._http_account.cancel_all_open_algo_orders,  # type: ignore [attr-defined]
-                symbol=instrument_id.symbol.value,
-            )
-
-            if not retry_manager.result:
-                if (
-                    retry_manager.message is not None
-                    and "Unknown order sent" in retry_manager.message
-                ):
-                    self._log.info(
-                        "No open algo orders to cancel according to Aster",
-                        LogColor.GREEN,
-                    )
-                else:
-                    for order in orders:
-                        if order.is_closed:
-                            continue
-                        self.generate_order_cancel_rejected(
-                            order.strategy_id,
-                            order.instrument_id,
-                            order.client_order_id,
-                            order.venue_order_id,
-                            retry_manager.message,
-                            self._clock.timestamp_ns(),
-                        )
-        finally:
-            await self._retry_manager_pool.release(retry_manager)
+        # Aster DEX does not support algo orders (/fapi/v1/algo returns 404).
+        # All conditional orders go through the standard /fapi/v1/order endpoint.
+        self._log.warning("Aster does not support algo orders — skipping algo batch cancel")
 
     async def _cancel_all_orders(self, command: CancelAllOrders) -> None:
         if command.order_side != OrderSide.NO_ORDER_SIDE:
@@ -1438,27 +1406,11 @@ class AsterCommonExecutionClient(LiveExecutionClient):
 
         # Only use batch cancel if this strategy owns all orders for the instrument
         if total_orders_count == len(all_strategy_orders):
-            algo_orders: list[Order] = []
-            regular_orders: list[Order] = []
-
-            if self._aster_account_type.is_futures:
-                for order in all_strategy_orders:
-                    if order.order_type in ASTER_FUTURES_ALGO_ORDER_TYPES:
-                        # Triggered algo orders become regular orders and need regular cancel
-                        if order.client_order_id in self._triggered_algo_order_ids:
-                            regular_orders.append(order)
-                        else:
-                            algo_orders.append(order)
-                    else:
-                        regular_orders.append(order)
-            else:
-                regular_orders = all_strategy_orders
-
-            if algo_orders:
-                await self._cancel_algo_orders_batch(command.instrument_id, algo_orders)
-
-            if regular_orders:
-                await self._cancel_orders_batch(command.instrument_id, regular_orders)
+            # Aster DEX does not support algo orders (/fapi/v1/algo returns 404).
+            # All conditional orders go through the standard /fapi/v1/order endpoint,
+            # so we treat all orders as regular orders for cancellation.
+            if all_strategy_orders:
+                await self._cancel_orders_batch(command.instrument_id, all_strategy_orders)
             return
 
         # Not every order belongs to this strategy - cancel individually or in batches
@@ -1483,34 +1435,13 @@ class AsterCommonExecutionClient(LiveExecutionClient):
             )
             return
 
-        is_algo_order = (
-            self._aster_account_type.is_futures
-            and order.order_type in ASTER_FUTURES_ALGO_ORDER_TYPES
+        # Aster DEX does not support algo orders (/fapi/v1/algo returns 404).
+        # All conditional orders go through the standard /fapi/v1/order endpoint.
+        await self._http_account.cancel_order(
+            symbol=instrument_id.symbol.value,
+            order_id=int(venue_order_id.value) if venue_order_id else None,
+            orig_client_order_id=client_order_id.value if client_order_id else None,
         )
-
-        # Check if algo order has been triggered - use regular endpoint in that case
-        is_triggered = client_order_id in self._triggered_algo_order_ids
-
-        if is_algo_order and not is_triggered:
-            response = await self._http_account.cancel_algo_order(  # type: ignore [attr-defined]
-                algo_id=int(venue_order_id.value) if venue_order_id else None,
-                client_algo_id=client_order_id.value if client_order_id else None,
-            )
-            self._log.debug(
-                f"Algo order cancel response: algoId={response.algoId}, "
-                f"code={response.code}, msg={response.msg}",
-            )
-        else:
-            if is_triggered:
-                self._log.debug(
-                    f"Algo order {client_order_id} has been triggered, "
-                    f"using regular cancel endpoint with venue_order_id={venue_order_id}",
-                )
-            await self._http_account.cancel_order(
-                symbol=instrument_id.symbol.value,
-                order_id=int(venue_order_id.value) if venue_order_id else None,
-                orig_client_order_id=client_order_id.value if client_order_id else None,
-            )
 
     async def _cancel_orders_for_strategy(
         self,

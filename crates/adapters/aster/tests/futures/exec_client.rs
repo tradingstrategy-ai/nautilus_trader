@@ -763,7 +763,8 @@ async fn test_submit_order_generates_submitted_event() {
 #[rstest]
 #[tokio::test]
 async fn test_submit_trailing_stop_order_uses_activate_price_and_precise_callback_rate() {
-    let (addr, captured_query) = start_exec_test_server_with_algo_capture().await;
+    // Aster has no /fapi/v1/algo endpoint — trailing stops go through /fapi/v1/order
+    let (addr, captured_query) = start_exec_test_server_with_order_capture().await;
     let base_url_http = format!("http://{addr}");
     let base_url_ws = format!("ws://{addr}/ws");
 
@@ -843,9 +844,10 @@ async fn test_submit_trailing_stop_order_uses_activate_price_and_precise_callbac
 
     let query = captured_query.lock().unwrap().clone().unwrap();
     assert_eq!(query.get("type"), Some(&"TRAILING_STOP_MARKET".to_string()));
-    assert_eq!(query.get("activatePrice"), Some(&"10000.00".to_string()));
+    // Regular /fapi/v1/order uses activationPrice (not activatePrice from algo endpoint)
+    assert_eq!(query.get("activationPrice"), Some(&"10000.00".to_string()));
     assert_eq!(query.get("callbackRate"), Some(&"0.25".to_string()));
-    assert!(!query.contains_key("activationPrice"));
+    assert!(!query.contains_key("activatePrice"));
 }
 
 #[rstest]
