@@ -320,47 +320,6 @@ fn create_exec_test_router() -> Router {
         .route("/ws-fapi/v1", get(handle_ws_trading))
 }
 
-fn create_exec_test_router_with_algo_capture(
-    captured_query: &Arc<std::sync::Mutex<Option<HashMap<String, String>>>>,
-) -> Router {
-    create_exec_test_router().route(
-        "/fapi/v1/algoOrder",
-        post({
-            let captured_query = captured_query.clone();
-
-            move |headers: HeaderMap, Query(query): Query<HashMap<String, String>>| async move {
-                if !has_auth_headers(&headers) {
-                    return unauthorized_response();
-                }
-
-                *captured_query.lock().unwrap() = Some(query);
-
-                json_response(&json!({
-                    "algoId": 12345,
-                    "clientAlgoId": "test-algo-order-001",
-                    "algoType": "CONDITIONAL",
-                    "orderType": "TRAILING_STOP_MARKET",
-                    "symbol": "BTCUSDT",
-                    "side": "SELL",
-                    "positionSide": "BOTH",
-                    "timeInForce": "GTC",
-                    "quantity": "0.001",
-                    "algoStatus": "NEW",
-                    "triggerPrice": "10000.00",
-                    "price": "0",
-                    "workingType": "MARK_PRICE",
-                    "activatePrice": "10000.00",
-                    "callbackRate": "0.25",
-                    "reduceOnly": true,
-                    "closePosition": false,
-                    "priceProtect": false,
-                    "selfTradePreventionMode": "NONE"
-                }))
-            }
-        }),
-    )
-}
-
 async fn start_exec_test_server() -> SocketAddr {
     let router = create_exec_test_router();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -386,37 +345,6 @@ async fn start_exec_test_server() -> SocketAddr {
     .await;
 
     addr
-}
-
-async fn start_exec_test_server_with_algo_capture() -> (
-    SocketAddr,
-    Arc<std::sync::Mutex<Option<HashMap<String, String>>>>,
-) {
-    let captured_query = Arc::new(std::sync::Mutex::new(None));
-    let router = create_exec_test_router_with_algo_capture(&captured_query);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
-    tokio::spawn(async move {
-        axum::serve(listener, router.into_make_service())
-            .await
-            .unwrap();
-    });
-
-    let health_url = format!("http://{addr}/fapi/v1/ping");
-    let http_client =
-        HttpClient::new(HashMap::new(), Vec::new(), Vec::new(), None, None, None).unwrap();
-    wait_until_async(
-        || {
-            let url = health_url.clone();
-            let client = http_client.clone();
-            async move { client.get(url, None, None, Some(1), None).await.is_ok() }
-        },
-        Duration::from_secs(5),
-    )
-    .await;
-
-    (addr, captured_query)
 }
 
 fn create_exec_test_router_with_order_capture(

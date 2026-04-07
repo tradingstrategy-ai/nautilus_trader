@@ -26,8 +26,6 @@ pub mod factories;
 pub mod types;
 
 use nautilus_core::python::{to_pyruntime_err, to_pyvalue_err};
-use nautilus_model::data::ensure_rust_extractor_registered;
-use nautilus_serialization::ensure_custom_data_registered;
 use nautilus_system::{
     factories::{ClientConfig, DataClientFactory, ExecutionClientFactory},
     get_global_pyo3_registry,
@@ -133,9 +131,9 @@ pub fn aster(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
 
-    // Register AsterBar for Arrow/JSON serialization and Python extraction
-    ensure_custom_data_registered::<AsterBar>();
-    let _ = ensure_rust_extractor_registered::<AsterBar>();
+    // NOTE: AsterBar Arrow encode/decode traits not yet implemented.
+    // Skipping ensure_custom_data_registered::<AsterBar>() — Aster-specific
+    // bars use Python-side serialization via __init__.py for now.
 
     let registry = get_global_pyo3_registry();
 
