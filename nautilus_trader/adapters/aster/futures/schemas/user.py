@@ -53,6 +53,38 @@ from nautilus_trader.model.objects import Quantity
 from nautilus_trader.model.orders import Order
 
 
+#: NT ``OrderType`` values for which Aster emits ``EXPIRED`` on trigger
+#: rather than a dedicated ``TRIGGERED`` event (the Aster V1/V3 futures
+#: WS docs list no ``TRIGGERED`` in either the execution-type or
+#: order-status enum). ``TRAILING_STOP_MARKET`` is intentionally omitted
+#: — it has different venue semantics and is handled on its own branch.
+_TRIGGERABLE_ORDER_TYPES: frozenset[OrderType] = frozenset(
+    {
+        OrderType.STOP_MARKET,
+        OrderType.STOP_LIMIT,
+        OrderType.MARKET_IF_TOUCHED,
+        OrderType.LIMIT_IF_TOUCHED,
+    },
+)
+
+#: Subset of ``_TRIGGERABLE_ORDER_TYPES`` for which NT's ``Order.apply()``
+#: accepts an ``OrderTriggered`` event. Per
+#: ``nautilus_trader.model.orders.base.Order.apply`` (model/orders/base.pyx
+#: line ~1068): *"can only trigger STOP_LIMIT, TRAILING_STOP_LIMIT and
+#: LIMIT_IF_TOUCHED orders"*. ``STOP_MARKET`` / ``MARKET_IF_TOUCHED`` are
+#: rejected even though the FSM transition table allows ``ACCEPTED ->
+#: TRIGGERED``. For them we suppress the redundant venue ``NEW`` event
+#: via ``_recently_triggered_stop_ids`` but emit no ``OrderTriggered`` —
+#: the FSM transitions ``ACCEPTED -> FILLED`` directly when the venue's
+#: ``TRADE`` event arrives (a valid direct edge per ``_ORDER_STATE_TABLE``).
+_TRIGGERED_EVENT_ORDER_TYPES: frozenset[OrderType] = frozenset(
+    {
+        OrderType.STOP_LIMIT,
+        OrderType.LIMIT_IF_TOUCHED,
+    },
+)
+
+
 class AsterFuturesUserMsgData(msgspec.Struct, frozen=True):
     """
     Inner struct for execution WebSocket messages from Aster.
@@ -220,7 +252,7 @@ class AsterFuturesOrderData(msgspec.Struct, kw_only=True, frozen=True):
     si: int  # ignore
     ss: int  # ignore
     rp: str  # Realized Profit of the trade
-    gtd: int  # TIF GTD order auto cancel time
+    gtd: int = 0  # TIF GTD order auto cancel time (optional — Aster doesn't send it)
     W: int | None = None  # Working Time (when order was added to the book)
     V: str | None = None  # Self-Trade Prevention Mode
 
@@ -444,6 +476,17 @@ class AsterFuturesOrderData(msgspec.Struct, kw_only=True, frozen=True):
             if order.order_type == OrderType.TRAILING_STOP_MARKET and order.is_open:
                 return  # Already accepted: this is an update
 
+            # Swallow the redundant ``NEW`` event that Aster sends for the
+            # spawned market leg of a STOP/TAKE_PROFIT that just triggered.
+            # We already synthesized an ``OrderTriggered`` in the ``EXPIRED``
+            # branch below; NT's FSM has no ``TRIGGERED -> ACCEPTED`` edge, so
+            # applying this event would log an ``InvalidStateTrigger`` warning
+            # without changing the order's state. The same ``venue_order_id``
+            # is reused by Aster, so we match on the CLOID we tagged earlier.
+            if client_order_id in exec_client._recently_triggered_stop_ids:
+                exec_client._recently_triggered_stop_ids.discard(client_order_id)
+                return
+
             # Handle algo orders that were triggered and placed in matching engine
             # The ORDER_TRADE_UPDATE arrives with a new venue_order_id (actual order ID)
             if order.is_open and order.venue_order_id != venue_order_id:
@@ -517,6 +560,24 @@ class AsterFuturesOrderData(msgspec.Struct, kw_only=True, frozen=True):
                             ),
                             ts_event=ts_event,
                         )
+                    elif order.order_type in _TRIGGERABLE_ORDER_TYPES:
+                        # Edge case: Aster sent a ``TRADE`` execution with
+                        # ``L=0`` and status ``EXPIRED`` for a triggerable
+                        # order. Treat as a trigger, same rationale as the
+                        # main ``AsterExecutionType.EXPIRED`` branch below.
+                        # Always tag the CLOID so the redundant ``NEW``
+                        # event is suppressed; only emit ``OrderTriggered``
+                        # for order types whose ``Order.apply()`` accepts it
+                        # (see ``_TRIGGERED_EVENT_ORDER_TYPES``).
+                        exec_client._recently_triggered_stop_ids.add(client_order_id)
+                        if order.order_type in _TRIGGERED_EVENT_ORDER_TYPES:
+                            exec_client.generate_order_triggered(
+                                strategy_id=strategy_id,
+                                instrument_id=instrument_id,
+                                client_order_id=client_order_id,
+                                venue_order_id=venue_order_id,
+                                ts_event=ts_event,
+                            )
                     else:
                         exec_client.generate_order_expired(
                             strategy_id=strategy_id,
@@ -636,6 +697,38 @@ class AsterFuturesOrderData(msgspec.Struct, kw_only=True, frozen=True):
                     trigger_price=(Price(float(self.sp), price_precision) if self.sp else None),
                     ts_event=ts_event,
                 )
+            elif order.order_type in _TRIGGERABLE_ORDER_TYPES:
+                # Aster reuses the stop's ``venue_order_id`` and emits
+                # ``EXPIRED`` on the stop leg when a STOP or TAKE_PROFIT
+                # triggers — the market leg follows as ``NEW`` + ``TRADE``
+                # on the same ID. The Aster V1/V3 futures WS docs list no
+                # ``TRIGGERED`` value in either the execution-type enum
+                # (``NEW, CANCELED, CALCULATED, EXPIRED, TRADE``) or the
+                # order-status enum (``NEW, PARTIALLY_FILLED, FILLED,
+                # CANCELED, EXPIRED, NEW_INSURANCE, NEW_ADL``), and GTD is
+                # unsupported (TIF: ``GTC, IOC, FOK, GTX, HIDDEN``) — so by
+                # elimination ``EXPIRED`` on a triggerable order must mean
+                # the stop triggered.
+                #
+                # Routing: always tag the CLOID so the follow-up ``NEW``
+                # event is swallowed (see the ``AsterExecutionType.NEW``
+                # branch). Then, for LIMIT-based stops where NT's
+                # ``Order.apply()`` accepts ``OrderTriggered``, emit it so
+                # the FSM transitions ``ACCEPTED -> TRIGGERED -> FILLED``.
+                # For MARKET-based stops (STOP_MARKET / MARKET_IF_TOUCHED),
+                # emit nothing — ``Order.apply()`` rejects ``OrderTriggered``
+                # for those types, and ``ACCEPTED -> FILLED`` is a valid
+                # direct edge that fires when the venue's ``TRADE`` event
+                # arrives next. See ``_TRIGGERED_EVENT_ORDER_TYPES``.
+                exec_client._recently_triggered_stop_ids.add(client_order_id)
+                if order.order_type in _TRIGGERED_EVENT_ORDER_TYPES:
+                    exec_client.generate_order_triggered(
+                        strategy_id=strategy_id,
+                        instrument_id=instrument_id,
+                        client_order_id=client_order_id,
+                        venue_order_id=venue_order_id,
+                        ts_event=ts_event,
+                    )
             else:
                 exec_client.generate_order_expired(
                     strategy_id=strategy_id,
@@ -780,7 +873,7 @@ class AsterFuturesAlgoOrderData(msgspec.Struct, kw_only=True, frozen=True):
     pP: bool  # Price Protect
     R: bool  # Reduce Only
     tt: int  # Trigger Time
-    gtd: int  # Good Till Date
+    gtd: int = 0  # Good Till Date (optional — Aster doesn't send it)
     ai: str | None = None  # Order ID in matching engine (populated when triggered)
     ap: str | None = None  # Average fill price in matching engine
     aq: str | None = None  # Executed quantity in matching engine

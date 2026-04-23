@@ -276,6 +276,26 @@ class AsterCommonExecutionClient(LiveExecutionClient):
         # This set is kept empty for interface compatibility but is never populated.
         self._triggered_algo_order_ids: set[ClientOrderId] = set()
 
+        #: Tracks STOP/TAKE-PROFIT orders that have just emitted a synthesized
+        #: ``OrderTriggered`` event in response to Aster's ``EXPIRED`` execution
+        #: type. Aster reuses the same ``venue_order_id`` and follows the
+        #: ``EXPIRED`` event with ``NEW`` + ``TRADE`` for the spawned market leg;
+        #: the ``NEW`` event is redundant on our side (NT already transitioned to
+        #: ``TRIGGERED``) and must be swallowed to avoid an ``InvalidStateTrigger``
+        #: warning (``TRIGGERED -> ACCEPTED`` is not a valid FSM transition).
+        #:
+        #: Populated in ``AsterFuturesExecutionEventHandler._handle_execution_event``
+        #: when ``x == EXPIRED`` for a triggerable order type; discarded when the
+        #: follow-up ``NEW`` event is suppressed.
+        #:
+        #: Live capture: ``O-20260422-000000-001-001-2`` showed
+        #: ``EXPIRED -> NEW (discarded) -> TRADE (applied)`` with the same
+        #: ``venue_order_id=2180373703``. See Aster V1/V3 futures API docs: the
+        #: documented execution-type enum (``NEW, CANCELED, CALCULATED, EXPIRED,
+        #: TRADE``) has no ``TRIGGERED``, and GTD is unsupported, so ``EXPIRED``
+        #: on a STOP/TAKE_PROFIT must mean the order triggered.
+        self._recently_triggered_stop_ids: set[ClientOrderId] = set()
+
         self._retry_manager_pool = RetryManagerPool[None](
             pool_size=100,
             max_retries=config.max_retries or 0,
