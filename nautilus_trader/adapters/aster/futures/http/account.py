@@ -856,6 +856,83 @@ class AsterFuturesCancelAllAlgoOrdersHttp(AsterHttpEndpoint):
         return self._delete_resp_decoder.decode(raw)
 
 
+class AsterFuturesIncomeRecord(msgspec.Struct, kw_only=True, frozen=True):
+    """
+    Single record from ``GET /fapi/v3/income`` (Aster income history).
+
+    ``tranId`` is unique per ``incomeType`` per user — used as the dedup key
+    for application-side flow tracking (deposits, withdrawals, funding, etc.).
+
+    ``income`` is a signed decimal string: positive for credits
+    (deposits, rebates) and negative for debits (withdrawals, commissions).
+
+    References
+    ----------
+    https://github.com/asterdex/api-docs/blob/master/V3(Recommended)/EN/aster-finance-futures-api-v3.md#get-income-historyuser_data
+    """
+
+    symbol: str
+    incomeType: str
+    income: str
+    asset: str
+    info: str
+    time: int
+    tranId: str
+    tradeId: str | None = None
+
+
+class AsterFuturesIncomeHttp(AsterHttpEndpoint):
+    """
+    Endpoint for income / transfer history.
+
+    ``GET /fapi/v3/income``
+
+    References
+    ----------
+    https://github.com/asterdex/api-docs/blob/master/V3(Recommended)/EN/aster-finance-futures-api-v3.md#get-income-historyuser_data
+
+    """
+
+    def __init__(self, client: AsterHttpClient, base_endpoint: str):
+        methods = {HttpMethod.GET: AsterSecurityType.USER_DATA}
+        super().__init__(client, methods, base_endpoint + "income")
+        self._resp_decoder = msgspec.json.Decoder(list[AsterFuturesIncomeRecord])
+
+    class GetParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+        """
+        Parameters of income GET request.
+
+        Parameters
+        ----------
+        timestamp : str
+            Millisecond timestamp of the request.
+        incomeType : str, optional
+            Filter by type: TRANSFER, REALIZED_PNL, FUNDING_FEE, COMMISSION,
+            INSURANCE_CLEAR, WELCOME_BONUS, MARKET_MERCHANT_RETURN_REWARD.
+        startTime : int, optional
+            Inclusive start time in ms.
+        endTime : int, optional
+            Inclusive end time in ms.
+        limit : int, optional
+            Default 100; max 1000.
+        recvWindow : str, optional
+            Response receive window (max 60000 ms).
+
+        """
+
+        timestamp: str
+        incomeType: str | None = None
+        startTime: int | None = None
+        endTime: int | None = None
+        limit: int | None = None
+        recvWindow: str | None = None
+
+    async def get(self, params: GetParameters) -> list[AsterFuturesIncomeRecord]:
+        method_type = HttpMethod.GET
+        raw = await self._method(method_type, params)
+        return self._resp_decoder.decode(raw)
+
+
 class AsterFuturesAccountHttpAPI(AsterAccountHttpAPI):
     """
     Provides access to the Aster Futures Account/Trade HTTP REST API.
@@ -934,6 +1011,56 @@ class AsterFuturesAccountHttpAPI(AsterAccountHttpAPI):
         self._endpoint_futures_cancel_all_algo_orders = AsterFuturesCancelAllAlgoOrdersHttp(
             client,
             self.base_endpoint,
+        )
+        self._endpoint_futures_income = AsterFuturesIncomeHttp(client, v3_endpoint_base)
+
+    async def query_income_history(
+        self,
+        income_type: str | None = None,
+        start_time: int | None = None,
+        end_time: int | None = None,
+        limit: int | None = None,
+        recv_window: str | None = None,
+    ) -> list[AsterFuturesIncomeRecord]:
+        """
+        Fetch Aster Futures income / transfer history.
+
+        Returns records newest-first. ``AsterFuturesIncomeRecord.tranId`` is
+        the unique identifier per ``incomeType`` per user — use it as a
+        dedup key when tracking flows across polls.
+
+        Parameters
+        ----------
+        income_type : str, optional
+            Filter by type. Use ``"TRANSFER"`` to capture deposits and
+            withdrawals only. Pass ``None`` to receive all types.
+        start_time : int, optional
+            Inclusive start time in Unix ms.
+        end_time : int, optional
+            Inclusive end time in Unix ms.
+        limit : int, optional
+            Max records to return; default 100, max 1000.
+        recv_window : str, optional
+            Optional receive window (ms, max 60000).
+
+        Returns
+        -------
+        list[AsterFuturesIncomeRecord]
+            Records ordered newest-first by the venue.
+
+        References
+        ----------
+        https://github.com/asterdex/api-docs/blob/master/V3(Recommended)/EN/aster-finance-futures-api-v3.md#get-income-historyuser_data
+        """
+        return await self._endpoint_futures_income.get(
+            params=self._endpoint_futures_income.GetParameters(
+                timestamp=self._timestamp(),
+                incomeType=income_type,
+                startTime=start_time,
+                endTime=end_time,
+                limit=limit,
+                recvWindow=recv_window,
+            ),
         )
 
     async def query_futures_hedge_mode(
