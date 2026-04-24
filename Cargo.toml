@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "crates",
   "crates/adapters/architect_ax",
+  "crates/adapters/aster",
   "crates/adapters/betfair",
   "crates/adapters/binance",
   "crates/adapters/bitmex",
@@ -91,6 +92,7 @@ nautilus-trading = { path = "crates/trading", version = "0.55.0" }
 # Note: default-features = false to control high-precision separately (not supported on Windows)
 # -----------------------------------------------------------------------------
 nautilus-architect-ax = { path = "crates/adapters/architect_ax", version = "0.55.0" }
+nautilus-aster = { path = "crates/adapters/aster", version = "0.55.0", default-features = false }
 nautilus-binance = { path = "crates/adapters/binance", version = "0.55.0", default-features = false }
 nautilus-bitmex = { path = "crates/adapters/bitmex", version = "0.55.0", default-features = false }
 nautilus-blockchain = { path = "crates/adapters/blockchain", version = "0.55.0" }
