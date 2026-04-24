@@ -635,13 +635,37 @@ class AsterCommonDataClient(LiveMarketDataClient):
                 )
                 return
 
-            bars = await self._http_market.request_aster_bars(
-                bar_type=request.bar_type,
-                interval=interval,
-                start_time=start_time_ms,
-                end_time=end_time_ms,
-                limit=request.limit if request.limit > 0 else None,
-            )
+            # Retry on transient errors (notably -1003 TOO_MANY_REQUESTS).
+            # Startup bar-fetch bursts can briefly exceed the 2400/min global
+            # cap even with client-side rate limiting; without retry the
+            # affected (symbol, timeframe) history is permanently absent until
+            # the next restart. Matches the existing _should_retry / _retry_delay
+            # / _max_retries infrastructure already in this class.
+            retries = 0
+            while True:
+                try:
+                    bars = await self._http_market.request_aster_bars(
+                        bar_type=request.bar_type,
+                        interval=interval,
+                        start_time=start_time_ms,
+                        end_time=end_time_ms,
+                        limit=request.limit if request.limit > 0 else None,
+                    )
+                    break
+                except AsterError as e:
+                    if not isinstance(e.message, dict) or "code" not in e.message:
+                        raise
+                    error_code = AsterErrorCode(int(e.message["code"]))
+                    if not self._should_retry(error_code, retries):
+                        raise
+                    retries += 1
+                    retry_delay_s = self._retry_delay * (2 ** (retries - 1))
+                    self._log.warning(
+                        f"Transient error ({error_code.value}) on bar fetch for "
+                        f"{request.bar_type}; retrying {retries}/{self._max_retries} "
+                        f"in {retry_delay_s:.1f}s",
+                    )
+                    await asyncio.sleep(retry_delay_s)
 
             if request.bar_type.is_internally_aggregated():
                 self._log.info(
