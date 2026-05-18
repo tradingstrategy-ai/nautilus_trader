@@ -148,7 +148,7 @@ impl AsterFuturesDataClient {
         let clock = get_atomic_clock_realtime();
         let data_sender = get_data_event_sender();
 
-        let http_client = AsterFuturesHttpClient::new(
+        let http_client = AsterFuturesHttpClient::new_with_local_addr(
             product_type,
             config.environment,
             clock,
@@ -159,15 +159,17 @@ impl AsterFuturesDataClient {
             None,  // timeout_secs
             None,  // proxy_url
             false, // treat_expired_as_canceled
+            config.local_addr,
         )?;
 
-        let ws_client = AsterFuturesWebSocketClient::new(
+        let ws_client = AsterFuturesWebSocketClient::new_with_local_addr(
             product_type,
             config.environment,
             config.api_key.clone(),
             config.api_secret.clone(),
             config.base_url_ws.clone(),
             Some(20), // Heartbeat interval
+            config.local_addr,
         )?;
 
         Ok(Self {

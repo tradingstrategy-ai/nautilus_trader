@@ -164,6 +164,7 @@ impl PolymarketWebSocketClient {
             reconnect_jitter_ms: Some(200),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            local_addr: None,
         };
 
         let client =

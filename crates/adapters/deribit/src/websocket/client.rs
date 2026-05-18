@@ -481,6 +481,7 @@ impl DeribitWebSocketClient {
             reconnect_jitter_ms: None,
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            local_addr: None,
         };
 
         // Configure rate limits

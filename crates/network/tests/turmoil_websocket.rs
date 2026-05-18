@@ -43,6 +43,7 @@ fn websocket_config() -> WebSocketConfig {
         reconnect_jitter_ms: Some(10),
         reconnect_max_attempts: None,
         idle_timeout_ms: None,
+        local_addr: None,
     }
 }
 

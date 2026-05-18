@@ -25,7 +25,7 @@
 //!
 //! Use `Some(n)` primarily for testing, development, or non-critical connections.
 
-use std::fmt::Debug;
+use std::{fmt::Debug, net::IpAddr};
 
 /// Configuration for WebSocket client connections.
 ///
@@ -95,4 +95,43 @@ pub struct WebSocketConfig {
     /// connections where the server stops sending without closing.
     /// **Note**: Only applies to handler mode. Ignored in stream mode.
     pub idle_timeout_ms: Option<u64>,
+    /// Optional local IP address to bind outbound TCP connections to.
+    ///
+    /// When `Some(ip)`, the TCP socket is explicitly bound to this address before
+    /// connecting — used to pin a single process to a specific source IP, e.g. when
+    /// a venue rate-limits by source IP and the host has multiple IPs available.
+    /// When `None` (default), the kernel selects the source IP from the routing table
+    /// and the standard `connect_async_with_config` fast path is used.
+    ///
+    /// **Note**: For the `turmoil` test feature this field is accepted but ignored —
+    /// the simulator routes via a virtual network without real bind semantics.
+    pub local_addr: Option<IpAddr>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    fn test_local_addr_defaults_to_none_via_builder() {
+        // Builder omits local_addr → should be None (Option default).
+        let cfg = WebSocketConfig::builder()
+            .url("ws://example.test".to_string())
+            .build();
+        assert!(cfg.local_addr.is_none());
+    }
+
+    #[rstest]
+    fn test_local_addr_round_trips_via_builder() {
+        let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let cfg = WebSocketConfig::builder()
+            .url("wss://example.test".to_string())
+            .local_addr(ip)
+            .build();
+        assert_eq!(cfg.local_addr, Some(ip));
+    }
 }

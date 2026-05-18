@@ -146,14 +146,30 @@ impl HyperliquidRawHttpClient {
         timeout_secs: u64,
         proxy_url: Option<String>,
     ) -> std::result::Result<Self, HttpClientError> {
+        Self::new_with_local_addr(is_testnet, timeout_secs, proxy_url, None)
+    }
+
+    /// Creates a new [`HyperliquidRawHttpClient`] for public endpoints with an optional
+    /// `local_addr` to pin outbound TCP connections to a specific source IP.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP client cannot be created.
+    pub fn new_with_local_addr(
+        is_testnet: bool,
+        timeout_secs: u64,
+        proxy_url: Option<String>,
+        local_addr: Option<std::net::IpAddr>,
+    ) -> std::result::Result<Self, HttpClientError> {
         Ok(Self {
-            client: HttpClient::new(
+            client: HttpClient::new_with_local_addr(
                 Self::default_headers(),
                 vec![],
                 vec![],
                 Some(*HYPERLIQUID_REST_QUOTA),
                 Some(timeout_secs),
                 proxy_url,
+                local_addr,
             )?,
             is_testnet,
             base_info: info_url(is_testnet).to_string(),
@@ -179,17 +195,33 @@ impl HyperliquidRawHttpClient {
         timeout_secs: u64,
         proxy_url: Option<String>,
     ) -> std::result::Result<Self, HttpClientError> {
+        Self::with_credentials_and_local_addr(secrets, timeout_secs, proxy_url, None)
+    }
+
+    /// Creates a new [`HyperliquidRawHttpClient`] with credentials and an optional
+    /// `local_addr` to pin outbound TCP connections to a specific source IP.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP client cannot be created.
+    pub fn with_credentials_and_local_addr(
+        secrets: &Secrets,
+        timeout_secs: u64,
+        proxy_url: Option<String>,
+        local_addr: Option<std::net::IpAddr>,
+    ) -> std::result::Result<Self, HttpClientError> {
         let signer = HyperliquidEip712Signer::new(secrets.private_key.clone());
         let nonce_manager = Arc::new(NonceManager::new());
 
         Ok(Self {
-            client: HttpClient::new(
+            client: HttpClient::new_with_local_addr(
                 Self::default_headers(),
                 vec![],
                 vec![],
                 Some(*HYPERLIQUID_REST_QUOTA),
                 Some(timeout_secs),
                 proxy_url,
+                local_addr,
             )?,
             is_testnet: secrets.is_testnet,
             base_info: info_url(secrets.is_testnet).to_string(),
@@ -238,9 +270,33 @@ impl HyperliquidRawHttpClient {
         timeout_secs: u64,
         proxy_url: Option<String>,
     ) -> Result<Self> {
+        Self::from_credentials_with_local_addr(
+            private_key,
+            vault_address,
+            is_testnet,
+            timeout_secs,
+            proxy_url,
+            None,
+        )
+    }
+
+    /// Creates a new [`HyperliquidRawHttpClient`] with credentials and an optional
+    /// `local_addr` for source-IP pinning.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Auth`] if the private key is invalid or cannot be parsed.
+    pub fn from_credentials_with_local_addr(
+        private_key: &str,
+        vault_address: Option<&str>,
+        is_testnet: bool,
+        timeout_secs: u64,
+        proxy_url: Option<String>,
+        local_addr: Option<std::net::IpAddr>,
+    ) -> Result<Self> {
         let secrets = Secrets::from_private_key(private_key, vault_address, is_testnet)
             .map_err(|e| Error::auth(format!("invalid credentials: {e}")))?;
-        Self::with_credentials(&secrets, timeout_secs, proxy_url)
+        Self::with_credentials_and_local_addr(&secrets, timeout_secs, proxy_url, local_addr)
             .map_err(|e| Error::auth(format!("Failed to create HTTP client: {e}")))
     }
 
@@ -800,7 +856,27 @@ impl HyperliquidHttpClient {
         timeout_secs: u64,
         proxy_url: Option<String>,
     ) -> std::result::Result<Self, HttpClientError> {
-        let raw_client = HyperliquidRawHttpClient::new(is_testnet, timeout_secs, proxy_url)?;
+        Self::new_with_local_addr(is_testnet, timeout_secs, proxy_url, None)
+    }
+
+    /// Creates a new [`HyperliquidHttpClient`] for public endpoints with an optional
+    /// `local_addr` to pin outbound TCP connections to a specific source IP.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP client cannot be created.
+    pub fn new_with_local_addr(
+        is_testnet: bool,
+        timeout_secs: u64,
+        proxy_url: Option<String>,
+        local_addr: Option<std::net::IpAddr>,
+    ) -> std::result::Result<Self, HttpClientError> {
+        let raw_client = HyperliquidRawHttpClient::new_with_local_addr(
+            is_testnet,
+            timeout_secs,
+            proxy_url,
+            local_addr,
+        )?;
         Ok(Self::from_raw(raw_client))
     }
 
@@ -814,8 +890,27 @@ impl HyperliquidHttpClient {
         timeout_secs: u64,
         proxy_url: Option<String>,
     ) -> std::result::Result<Self, HttpClientError> {
-        let raw_client =
-            HyperliquidRawHttpClient::with_credentials(secrets, timeout_secs, proxy_url)?;
+        Self::with_secrets_and_local_addr(secrets, timeout_secs, proxy_url, None)
+    }
+
+    /// Creates a new [`HyperliquidHttpClient`] with credentials and an optional
+    /// `local_addr` to pin outbound TCP connections to a specific source IP.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP client cannot be created.
+    pub fn with_secrets_and_local_addr(
+        secrets: &Secrets,
+        timeout_secs: u64,
+        proxy_url: Option<String>,
+        local_addr: Option<std::net::IpAddr>,
+    ) -> std::result::Result<Self, HttpClientError> {
+        let raw_client = HyperliquidRawHttpClient::with_credentials_and_local_addr(
+            secrets,
+            timeout_secs,
+            proxy_url,
+            local_addr,
+        )?;
         Ok(Self::from_raw(raw_client))
     }
 
@@ -895,6 +990,33 @@ impl HyperliquidHttpClient {
         timeout_secs: u64,
         proxy_url: Option<String>,
     ) -> Result<Self> {
+        Self::with_credentials_and_local_addr(
+            private_key,
+            vault_address,
+            account_address,
+            is_testnet,
+            timeout_secs,
+            proxy_url,
+            None,
+        )
+    }
+
+    /// Like [`with_credentials`](Self::with_credentials) but accepts an optional
+    /// `local_addr` to pin outbound TCP connections to a specific source IP.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Auth`] if credentials are invalid.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_credentials_and_local_addr(
+        private_key: Option<String>,
+        vault_address: Option<String>,
+        account_address: Option<String>,
+        is_testnet: bool,
+        timeout_secs: u64,
+        proxy_url: Option<String>,
+        local_addr: Option<std::net::IpAddr>,
+    ) -> Result<Self> {
         // Determine which env vars to use based on is_testnet
         let pk_env_var = if is_testnet {
             "HYPERLIQUID_TESTNET_PK"
@@ -927,12 +1049,13 @@ impl HyperliquidHttpClient {
 
         match resolved_pk {
             Some(pk) => {
-                let raw_client = HyperliquidRawHttpClient::from_credentials(
+                let raw_client = HyperliquidRawHttpClient::from_credentials_with_local_addr(
                     &pk,
                     resolved_vault.as_deref(),
                     is_testnet,
                     timeout_secs,
                     proxy_url,
+                    local_addr,
                 )?;
                 Ok(Self {
                     inner: Arc::new(raw_client),
@@ -948,7 +1071,7 @@ impl HyperliquidHttpClient {
             }
             None => {
                 // No credentials available, create unauthenticated client
-                Self::new(is_testnet, timeout_secs, proxy_url)
+                Self::new_with_local_addr(is_testnet, timeout_secs, proxy_url, local_addr)
                     .map_err(|e| Error::auth(format!("Failed to create HTTP client: {e}")))
             }
         }

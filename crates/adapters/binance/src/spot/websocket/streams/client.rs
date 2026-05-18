@@ -428,6 +428,7 @@ impl BinanceSpotWebSocketClient {
             reconnect_jitter_ms: Some(250),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            local_addr: None,
         };
 
         let keyed_quotas = vec![(

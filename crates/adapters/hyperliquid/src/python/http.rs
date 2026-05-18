@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::collections::HashMap;
+use std::{collections::HashMap, str::FromStr};
 
 use nautilus_core::python::{IntoPyObjectNautilusExt, to_pyvalue_err};
 use nautilus_model::{
@@ -42,7 +42,8 @@ impl HyperliquidHttpClient {
     /// with Nautilus domain types. It maintains an instrument cache and handles conversions
     /// between Hyperliquid API responses and Nautilus domain models.
     #[new]
-    #[pyo3(signature = (private_key=None, vault_address=None, account_address=None, is_testnet=false, timeout_secs=60, proxy_url=None, normalize_prices=true))]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (private_key=None, vault_address=None, account_address=None, is_testnet=false, timeout_secs=60, proxy_url=None, normalize_prices=true, local_addr=None))]
     fn py_new(
         private_key: Option<String>,
         vault_address: Option<String>,
@@ -51,14 +52,23 @@ impl HyperliquidHttpClient {
         timeout_secs: u64,
         proxy_url: Option<String>,
         normalize_prices: bool,
+        local_addr: Option<String>,
     ) -> PyResult<Self> {
-        let mut client = Self::with_credentials(
+        let local_addr_parsed = match local_addr {
+            Some(addr_str) => Some(
+                std::net::IpAddr::from_str(&addr_str)
+                    .map_err(|e| to_pyvalue_err(format!("Invalid local_addr '{addr_str}': {e}")))?,
+            ),
+            None => None,
+        };
+        let mut client = Self::with_credentials_and_local_addr(
             private_key,
             vault_address,
             account_address,
             is_testnet,
             timeout_secs,
             proxy_url,
+            local_addr_parsed,
         )
         .map_err(to_pyvalue_err)?;
         client.set_normalize_prices(normalize_prices);

@@ -15,7 +15,9 @@
 
 //! HTTP client implementation with rate limiting and timeout support.
 
-use std::{borrow::Cow, collections::HashMap, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    borrow::Cow, collections::HashMap, net::IpAddr, str::FromStr, sync::Arc, time::Duration,
+};
 
 use nautilus_core::collections::into_ustr_vec;
 use nautilus_cryptography::providers::install_cryptographic_provider;
@@ -77,6 +79,40 @@ impl HttpClient {
         timeout_secs: Option<u64>,
         proxy_url: Option<String>,
     ) -> Result<Self, HttpClientError> {
+        Self::new_with_local_addr(
+            headers,
+            header_keys,
+            keyed_quotas,
+            default_quota,
+            timeout_secs,
+            proxy_url,
+            None,
+        )
+    }
+
+    /// Creates a new [`HttpClient`] instance with an optional local source-address binding.
+    ///
+    /// When `local_addr` is `Some(ip)`, all outbound TCP connections from this client
+    /// will originate from the given local IP. This is used to pin a process to a
+    /// specific source IP (e.g. for venues that rate-limit by source IP).
+    ///
+    /// When `local_addr` is `None`, the kernel selects the default source IP — behaviour
+    /// is identical to [`HttpClient::new`].
+    ///
+    /// # Errors
+    ///
+    /// - Returns `InvalidProxy` if the proxy URL is malformed.
+    /// - Returns `ClientBuildError` if building the underlying `reqwest::Client` fails.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_local_addr(
+        headers: HashMap<String, String>,
+        header_keys: Vec<String>,
+        keyed_quotas: Vec<(String, Quota)>,
+        default_quota: Option<Quota>,
+        timeout_secs: Option<u64>,
+        proxy_url: Option<String>,
+        local_addr: Option<IpAddr>,
+    ) -> Result<Self, HttpClientError> {
         install_cryptographic_provider();
 
         // Build default headers
@@ -108,6 +144,12 @@ impl HttpClient {
             let proxy = reqwest::Proxy::all(&proxy_url)
                 .map_err(|e| HttpClientError::InvalidProxy(format!("{proxy_url}: {e}")))?;
             client_builder = client_builder.proxy(proxy);
+        }
+
+        // Bind outbound socket to a specific local IP, when requested. The kernel
+        // would otherwise pick a default source address from the routing table.
+        if let Some(local_addr) = local_addr {
+            client_builder = client_builder.local_address(local_addr);
         }
 
         let client = client_builder
@@ -838,5 +880,88 @@ mod tests {
         let response = client.delete(url, None, None, None, None).await.unwrap();
 
         assert!(response.status.is_success());
+    }
+
+    // ---------- local_addr (source-IP pinning) ----------
+
+    #[rstest]
+    fn test_http_client_with_local_addr_none_matches_default() {
+        // `new_with_local_addr(..., None)` should behave identically to `new(...)`.
+        let a = HttpClient::new(HashMap::new(), vec![], vec![], None, None, None);
+        let b = HttpClient::new_with_local_addr(
+            HashMap::new(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(a.is_ok());
+        assert!(b.is_ok());
+    }
+
+    #[rstest]
+    fn test_http_client_with_local_addr_loopback_v4() {
+        // Binding to 127.0.0.1 must succeed on every host. We do not actually issue a
+        // request — we only assert that the reqwest client builds, which is sufficient
+        // to validate the local_address plumbing.
+        let local = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let result = HttpClient::new_with_local_addr(
+            HashMap::new(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            Some(local),
+        );
+        assert!(
+            result.is_ok(),
+            "expected client build to succeed with local_addr=127.0.0.1, was {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_http_client_local_addr_loopback_v4_request() {
+        // Boot an axum server on 127.0.0.1 and verify a client pinned to 127.0.0.1
+        // can complete a request end-to-end. This is the closest thing to an
+        // integration test we can run locally without a multi-IP host.
+        let addr = start_test_server().await.unwrap();
+        let url = format!("http://{addr}/get");
+        let client = HttpClient::new_with_local_addr(
+            HashMap::new(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        )
+        .unwrap();
+        let response = client.get(url, None, None, None, None).await.unwrap();
+        assert!(response.status.is_success());
+        assert_eq!(String::from_utf8_lossy(&response.body), "hello-world!");
+    }
+
+    #[tokio::test]
+    async fn test_http_client_local_addr_unbindable_v4_returns_io_error() {
+        // 240.0.0.1 is in the reserved 240/4 block — kernel refuses to bind it.
+        // We expect the request itself (not the build) to fail, because reqwest
+        // performs the bind on connect, not on builder.build().
+        let addr = start_test_server().await.unwrap();
+        let url = format!("http://{addr}/get");
+        let client = HttpClient::new_with_local_addr(
+            HashMap::new(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            Some(IpAddr::V4(std::net::Ipv4Addr::new(240, 0, 0, 1))),
+        )
+        .unwrap();
+        let result = client.get(url, None, None, None, None).await;
+        assert!(result.is_err(), "expected bind to 240.0.0.1 to fail");
     }
 }

@@ -54,6 +54,10 @@ pub struct AsterDataClientConfig {
     /// changes (e.g. Trading -> Halt). Set to 0 to disable. Defaults to 3600 (60 minutes).
     #[builder(default = 3600)]
     pub instrument_status_poll_secs: u64,
+    /// Optional local source IP to bind outbound TCP connections to (REST + WS).
+    /// When `Some(ip)`, the client pins every outbound socket to this address;
+    /// when `None` (default), the kernel selects the source IP from the routing table.
+    pub local_addr: Option<std::net::IpAddr>,
 }
 
 impl Default for AsterDataClientConfig {
@@ -133,6 +137,9 @@ pub struct AsterExecClientConfig {
     /// and time-in-force combination.
     #[builder(default = false)]
     pub treat_expired_as_canceled: bool,
+    /// Optional local source IP to bind outbound TCP connections to (REST + WS).
+    /// See [`AsterDataClientConfig::local_addr`].
+    pub local_addr: Option<std::net::IpAddr>,
 }
 
 impl Default for AsterExecClientConfig {

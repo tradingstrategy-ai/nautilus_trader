@@ -42,6 +42,13 @@ class HyperliquidDataClientConfig(LiveDataClientConfig, frozen=True):
         If ``None`` then the instrument provider defaults are used.
     http_timeout_secs : PositiveInt, default 10
         The timeout (seconds) for HTTP requests.
+    local_addr : str, optional
+        Optional local source IP address to bind outbound TCP connections to (REST + WS).
+        When set, every outbound socket from this client originates from the given local
+        IP — used to pin a single bot process to a specific source IP, e.g. when
+        Hyperliquid rate-limits by source IP and the host has multiple IPs available.
+        Must be a valid IPv4 or IPv6 literal (e.g. ``"51.89.47.201"`` or ``"2001:db8::1"``).
+        When ``None`` (default), the kernel selects the source IP from the routing table.
 
     """
 
@@ -51,6 +58,7 @@ class HyperliquidDataClientConfig(LiveDataClientConfig, frozen=True):
     testnet: bool = False
     product_types: tuple[HyperliquidProductType, ...] | None = None
     http_timeout_secs: PositiveInt = 10
+    local_addr: str | None = None
 
 
 class HyperliquidExecClientConfig(LiveExecClientConfig, frozen=True):
@@ -100,6 +108,13 @@ class HyperliquidExecClientConfig(LiveExecClientConfig, frozen=True):
         dynamic constraint that depends on the price magnitude and cannot be fully encoded
         in the static instrument tick size. When enabled, prices are automatically rounded
         to comply with this rule. Disable if you want full control over price formatting.
+    local_addr : str, optional
+        Optional local source IP address to bind outbound TCP connections to (REST + WS).
+        When set, every outbound socket from this client originates from the given local
+        IP — used to pin a single bot process to a specific source IP, e.g. when
+        Hyperliquid rate-limits by source IP and the host has multiple IPs available.
+        Must be a valid IPv4 or IPv6 literal (e.g. ``"51.89.47.201"`` or ``"2001:db8::1"``).
+        When ``None`` (default), the kernel selects the source IP from the routing table.
 
     Warnings
     --------
@@ -120,3 +135,4 @@ class HyperliquidExecClientConfig(LiveExecClientConfig, frozen=True):
     retry_delay_max_ms: PositiveInt | None = None
     http_timeout_secs: PositiveInt = 10
     normalize_prices: bool = True
+    local_addr: str | None = None

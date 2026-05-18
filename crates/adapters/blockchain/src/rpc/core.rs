@@ -126,6 +126,7 @@ impl CoreBlockchainRpcClient {
             reconnect_jitter_ms: Some(1_000),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            local_addr: None,
         };
 
         let client =

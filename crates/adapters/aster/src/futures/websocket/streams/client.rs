@@ -90,6 +90,8 @@ pub struct AsterFuturesWebSocketClient {
     product_type: AsterProductType,
     credential: Option<Arc<SigningCredential>>,
     heartbeat: Option<u64>,
+    /// Optional local IP address for outbound socket binding (source-IP pinning).
+    local_addr: Option<std::net::IpAddr>,
     signal: Arc<AtomicBool>,
     slots: Arc<Mutex<Vec<ConnectionSlot>>>,
     out_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<AsterFuturesWsStreamsMessage>>>>,
@@ -126,6 +128,29 @@ impl AsterFuturesWebSocketClient {
         url_override: Option<String>,
         heartbeat: Option<u64>,
     ) -> anyhow::Result<Self> {
+        Self::new_with_local_addr(
+            product_type,
+            environment,
+            api_key,
+            api_secret,
+            url_override,
+            heartbeat,
+            None,
+        )
+    }
+
+    /// Like [`new`](Self::new) but accepts an optional `local_addr` to pin outbound
+    /// WebSocket TCP connections to a specific source IP.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_local_addr(
+        product_type: AsterProductType,
+        environment: AsterEnvironment,
+        api_key: Option<String>,
+        api_secret: Option<String>,
+        url_override: Option<String>,
+        heartbeat: Option<u64>,
+        local_addr: Option<std::net::IpAddr>,
+    ) -> anyhow::Result<Self> {
         match product_type {
             AsterProductType::UsdM | AsterProductType::CoinM => {}
             _ => {
@@ -148,6 +173,7 @@ impl AsterFuturesWebSocketClient {
             product_type,
             credential,
             heartbeat,
+            local_addr,
             signal: Arc::new(AtomicBool::new(false)),
             slots: Arc::new(Mutex::new(Vec::new())),
             out_tx: Arc::new(Mutex::new(None)),
@@ -462,6 +488,7 @@ impl AsterFuturesWebSocketClient {
             reconnect_jitter_ms: Some(250),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            local_addr: self.local_addr,
         };
 
         let keyed_quotas = vec![(

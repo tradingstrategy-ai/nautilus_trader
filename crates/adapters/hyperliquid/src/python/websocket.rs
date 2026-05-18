@@ -37,10 +37,31 @@ impl HyperliquidWebSocketClient {
     /// Orchestrates WebSocket connection and subscriptions using a command-based architecture,
     /// where the inner FeedHandler owns the WebSocketClient and handles all I/O.
     #[new]
-    #[pyo3(signature = (url=None, testnet=false, account_id=None))]
-    fn py_new(url: Option<String>, testnet: bool, account_id: Option<String>) -> Self {
+    #[pyo3(signature = (url=None, testnet=false, account_id=None, local_addr=None))]
+    fn py_new(
+        url: Option<String>,
+        testnet: bool,
+        account_id: Option<String>,
+        local_addr: Option<String>,
+    ) -> PyResult<Self> {
+        use std::str::FromStr;
         let account_id = account_id.map(|s| AccountId::from(s.as_str()));
-        Self::new(url, testnet, account_id)
+        let local_addr_parsed = match local_addr {
+            Some(addr_str) => Some(
+                std::net::IpAddr::from_str(&addr_str).map_err(|e| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "Invalid local_addr '{addr_str}': {e}"
+                    ))
+                })?,
+            ),
+            None => None,
+        };
+        Ok(Self::new_with_local_addr(
+            url,
+            testnet,
+            account_id,
+            local_addr_parsed,
+        ))
     }
 
     /// Returns the URL of this WebSocket client.

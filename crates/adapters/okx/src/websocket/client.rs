@@ -466,6 +466,7 @@ impl OKXWebSocketClient {
             reconnect_jitter_ms: None,
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            local_addr: None,
         };
 
         let keyed_quotas = vec![

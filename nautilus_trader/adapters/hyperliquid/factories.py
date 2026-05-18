@@ -47,6 +47,7 @@ def get_cached_hyperliquid_http_client(
     testnet: bool = False,
     proxy_url: str | None = None,
     normalize_prices: bool = True,
+    local_addr: str | None = None,
 ) -> nautilus_pyo3.HyperliquidHttpClient:
     """
     Cache and return a Hyperliquid HTTP client with the given parameters.
@@ -90,6 +91,7 @@ def get_cached_hyperliquid_http_client(
         "is_testnet": testnet,
         "proxy_url": proxy_url,
         "normalize_prices": normalize_prices,
+        "local_addr": local_addr,
     }
 
     if timeout_secs is not None:
@@ -180,6 +182,7 @@ class HyperliquidLiveDataClientFactory(LiveDataClientFactory):
             timeout_secs=config.http_timeout_secs,
             testnet=config.testnet,
             proxy_url=config.http_proxy_url,
+            local_addr=config.local_addr,
         )
         provider = get_cached_hyperliquid_instrument_provider(
             client=client,
@@ -243,6 +246,7 @@ class HyperliquidLiveExecClientFactory(LiveExecClientFactory):
             testnet=config.testnet,
             proxy_url=config.http_proxy_url,
             normalize_prices=config.normalize_prices,
+            local_addr=config.local_addr,
         )
         provider = get_cached_hyperliquid_instrument_provider(
             client=client,
