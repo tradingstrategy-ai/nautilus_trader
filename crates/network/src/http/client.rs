@@ -964,4 +964,57 @@ mod tests {
         let result = client.get(url, None, None, None, None).await;
         assert!(result.is_err(), "expected bind to 240.0.0.1 to fail");
     }
+
+    /// Strong proof: a control client (local_addr=None) succeeds against the
+    /// same URL while a treated client (local_addr=240.0.0.1) fails. Eliminates
+    /// the alternative explanation "request would have failed for another
+    /// reason". The only difference between the two is the local_addr.
+    #[tokio::test]
+    async fn test_http_client_local_addr_changes_behaviour_vs_none() {
+        let addr = start_test_server().await.unwrap();
+        let url = format!("http://{addr}/get");
+
+        // Control: no local_addr — must succeed.
+        let control = HttpClient::new_with_local_addr(
+            HashMap::new(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let control_result = control.get(url.clone(), None, None, None, None).await;
+        assert!(
+            control_result.is_ok(),
+            "control (local_addr=None) should succeed, was {control_result:?}"
+        );
+
+        // Treated: bind to an unbindable IP — must fail.
+        let treated = HttpClient::new_with_local_addr(
+            HashMap::new(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            Some(IpAddr::V4(std::net::Ipv4Addr::new(240, 0, 0, 1))),
+        )
+        .unwrap();
+        let treated_result = treated.get(url, None, None, None, None).await;
+        assert!(
+            treated_result.is_err(),
+            "treated (local_addr=240.0.0.1) should fail, was {treated_result:?}"
+        );
+
+        // The strong proof is differential: same URL, same server, same client
+        // construction — only local_addr differs. Control succeeded, treated
+        // failed. That is only possible if local_addr is being honored.
+        //
+        // Reqwest wraps the underlying bind failure in a generic "error
+        // sending request" so we can't grep the message reliably across
+        // platforms — the differential result is the proof.
+        let _ = treated_result.unwrap_err();
+    }
 }

@@ -134,4 +134,30 @@ mod tests {
             .build();
         assert_eq!(cfg.local_addr, Some(ip));
     }
+
+    #[rstest]
+    fn test_local_addr_survives_clone() {
+        // WebSocketClientInner stores config and reads config.local_addr from
+        // every reconnect call. Cloning the config (which happens implicitly
+        // when state machines pass the config around) must preserve local_addr.
+        let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let cfg = WebSocketConfig::builder()
+            .url("wss://example.test".to_string())
+            .local_addr(ip)
+            .build();
+        let cloned = cfg.clone();
+        assert_eq!(cloned.local_addr, Some(ip));
+    }
+
+    #[rstest]
+    fn test_local_addr_v6_round_trip() {
+        // Verify IPv6 addresses round-trip correctly (separate code path on
+        // the connect side: TcpSocket::new_v6 vs ::new_v4).
+        let ip = IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
+        let cfg = WebSocketConfig::builder()
+            .url("wss://example.test".to_string())
+            .local_addr(ip)
+            .build();
+        assert_eq!(cfg.local_addr, Some(ip));
+    }
 }
