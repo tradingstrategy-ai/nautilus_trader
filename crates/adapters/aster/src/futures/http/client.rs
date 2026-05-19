@@ -2557,4 +2557,52 @@ mod tests {
             other => panic!("Expected AsterError, was {other:?}"),
         }
     }
+
+    // ---------- local_addr plumbing ----------
+
+    #[rstest]
+    fn test_aster_raw_http_client_local_addr_none_equivalent_to_new() {
+        let a = AsterRawFuturesHttpClient::new(
+            AsterProductType::UsdM,
+            AsterEnvironment::Mainnet,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let b = AsterRawFuturesHttpClient::new_with_local_addr(
+            AsterProductType::UsdM,
+            AsterEnvironment::Mainnet,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(a.is_ok());
+        assert!(b.is_ok());
+    }
+
+    #[rstest]
+    fn test_aster_raw_http_client_local_addr_loopback_builds() {
+        let result = AsterRawFuturesHttpClient::new_with_local_addr(
+            AsterProductType::UsdM,
+            AsterEnvironment::Mainnet,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        );
+        assert!(
+            result.is_ok(),
+            "expected client to build with local_addr=127.0.0.1, was {result:?}"
+        );
+    }
 }

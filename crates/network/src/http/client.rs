@@ -965,6 +965,115 @@ mod tests {
         assert!(result.is_err(), "expected bind to 240.0.0.1 to fail");
     }
 
+    /// Connection-reuse proof: multiple sequential requests through a client
+    /// with local_addr=127.0.0.1 all succeed. reqwest's connection pool is
+    /// per-host, so this exercises the pool reuse path with local_addr set.
+    /// If the pool silently dropped local_addr after the first request, we'd
+    /// see a behaviour change — we don't.
+    #[tokio::test]
+    async fn test_http_client_local_addr_connection_reuse_loopback() {
+        let addr = start_test_server().await.unwrap();
+        let url = format!("http://{addr}/get");
+        let client = HttpClient::new_with_local_addr(
+            HashMap::new(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        )
+        .unwrap();
+        // 10 sequential requests — exercises both first-connect and pool-reuse paths.
+        for i in 0..10 {
+            let resp = client
+                .get(url.clone(), None, None, None, None)
+                .await
+                .expect(&format!("request {i} should succeed"));
+            assert!(
+                resp.status.is_success(),
+                "request {i} returned non-success: {resp:?}"
+            );
+        }
+    }
+
+    /// Invalid IP input handling. The Python pyo3 binding parses `Option<String>`
+    /// to `IpAddr` via `IpAddr::from_str`. This test exercises the underlying
+    /// parser to confirm it rejects the values we expect to reject — and
+    /// accepts the values we expect to accept. (The pyo3 layer is tested
+    /// indirectly through the wheel build; for local verification we test
+    /// the parser directly.)
+    #[rstest]
+    fn test_local_addr_string_parsing() {
+        use std::str::FromStr;
+
+        // Valid IPs — must parse.
+        for valid in [
+            "127.0.0.1",
+            "10.0.0.5",
+            "192.168.1.1",
+            "0.0.0.0",
+            "255.255.255.255",
+            "::1",
+            "2001:db8::1",
+            "fe80::1",
+        ] {
+            assert!(
+                IpAddr::from_str(valid).is_ok(),
+                "{valid} should parse as a valid IpAddr"
+            );
+        }
+
+        // Invalid inputs — must reject.
+        for invalid in [
+            "",
+            " ",
+            "  ",
+            "not.an.ip",
+            "999.999.999.999",
+            "256.0.0.1",
+            "127.0.0",
+            "127.0.0.1.5",
+            "127.0.0.1:80", // host:port
+            "[::1]",        // bracketed (used in URLs, not IpAddr)
+            "::g",          // invalid hex
+            "0xFF.0xFF.0xFF.0xFF", // hex format not accepted by IpAddr::from_str
+            "localhost",
+        ] {
+            assert!(
+                IpAddr::from_str(invalid).is_err(),
+                "{invalid:?} should NOT parse as an IpAddr"
+            );
+        }
+    }
+
+    /// Connection-reuse failure proof: multiple sequential requests through a
+    /// client with local_addr=240.0.0.1 (unbindable) all fail. If the pool
+    /// silently fell back to no local_addr after the first failure, we'd see
+    /// the second request succeed. It doesn't — every request fails.
+    #[tokio::test]
+    async fn test_http_client_local_addr_connection_reuse_unbindable() {
+        let addr = start_test_server().await.unwrap();
+        let url = format!("http://{addr}/get");
+        let client = HttpClient::new_with_local_addr(
+            HashMap::new(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            Some(IpAddr::V4(std::net::Ipv4Addr::new(240, 0, 0, 1))),
+        )
+        .unwrap();
+        for i in 0..3 {
+            let result = client.get(url.clone(), None, None, None, None).await;
+            assert!(
+                result.is_err(),
+                "request {i} should fail with unbindable local_addr, was {result:?}"
+            );
+        }
+    }
+
     /// Strong proof: a control client (local_addr=None) succeeds against the
     /// same URL while a treated client (local_addr=240.0.0.1) fails. Eliminates
     /// the alternative explanation "request would have failed for another

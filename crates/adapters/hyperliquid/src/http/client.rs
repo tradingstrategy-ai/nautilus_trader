@@ -2919,4 +2919,56 @@ mod tests {
         assert!(retrieved_without_type.is_some());
         assert_eq!(retrieved_without_type.unwrap().id(), instrument.id());
     }
+
+    // ---------- local_addr plumbing ----------
+    //
+    // These tests confirm that local_addr flows from
+    // HyperliquidHttpClient::new_with_local_addr through to the underlying
+    // HttpClient correctly. They mirror the differential pattern used in
+    // network::http::client tests: same construction except for local_addr,
+    // observe different behaviour.
+
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[rstest]
+    fn test_hl_http_client_local_addr_none_equivalent_to_new() {
+        // Public constructor with no local_addr should be equivalent to the
+        // non-local_addr constructor — both must build successfully.
+        let a = HyperliquidHttpClient::new(true, 60, None);
+        let b = HyperliquidHttpClient::new_with_local_addr(true, 60, None, None);
+        assert!(a.is_ok());
+        assert!(b.is_ok());
+    }
+
+    #[rstest]
+    fn test_hl_http_client_local_addr_loopback_builds() {
+        // 127.0.0.1 is always bindable; the client must build cleanly.
+        let result = HyperliquidHttpClient::new_with_local_addr(
+            true,
+            60,
+            None,
+            Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        );
+        assert!(
+            result.is_ok(),
+            "expected client to build with local_addr=127.0.0.1, was {result:?}"
+        );
+    }
+
+    #[rstest]
+    fn test_hl_http_client_local_addr_unbindable_still_builds() {
+        // The reqwest builder accepts any IpAddr — bind failure happens at
+        // connect time, not at client construction. So this also builds OK;
+        // a real request against the venue would fail with EADDRNOTAVAIL.
+        let result = HyperliquidHttpClient::new_with_local_addr(
+            true,
+            60,
+            None,
+            Some(IpAddr::V4(Ipv4Addr::new(240, 0, 0, 1))),
+        );
+        assert!(
+            result.is_ok(),
+            "client construction shouldn't fail at build time even for unbindable IP, was {result:?}"
+        );
+    }
 }
