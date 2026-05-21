@@ -68,6 +68,7 @@ pub mod backoff;
 pub mod http;
 pub mod mode;
 pub mod net;
+pub mod pool;
 pub mod retry;
 pub mod socket;
 pub mod websocket;
