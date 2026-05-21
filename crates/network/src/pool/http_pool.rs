@@ -21,7 +21,7 @@ impl HttpPool {
     /// # Errors
     /// - `PoolError::Empty` if `addresses` is empty.
     /// - `PoolError::BindFailed` if any `HttpClient::new_with_local_addr` call fails.
-    pub fn new(template: HttpClientTemplate, addresses: Vec<IpAddr>) -> Result<Self, PoolError> {
+    pub fn new(template: &HttpClientTemplate, addresses: Vec<IpAddr>) -> Result<Self, PoolError> {
         if addresses.is_empty() {
             return Err(PoolError::Empty);
         }
@@ -32,7 +32,7 @@ impl HttpPool {
                     template.headers.clone(),
                     template.header_keys.clone(),
                     template.keyed_quotas.clone(),
-                    template.default_quota.clone(),
+                    template.default_quota,
                     template.timeout_secs,
                     template.proxy_url.clone(),
                     Some(addr),
@@ -49,6 +49,9 @@ impl HttpPool {
     ///
     /// Returned pool has `len() == 1` and `dispatch_async` is a no-op
     /// round-robin (always picks slot 0).
+    ///
+    /// # Errors
+    /// - `PoolError::BindFailed` if the underlying `HttpClient::new_with_local_addr` call fails.
     pub fn new_no_bind(template: HttpClientTemplate) -> Result<Self, PoolError> {
         let client = HttpClient::new_with_local_addr(
             template.headers,
@@ -72,6 +75,10 @@ impl HttpPool {
 
     pub fn len(&self) -> usize {
         self.slots.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
     }
 
     /// Round-robin dispatch. Returns `(slot_index, closure_result)`.
@@ -114,14 +121,14 @@ mod tests {
 
     #[test]
     fn empty_input_errors() {
-        let err = HttpPool::new(loopback_template(), vec![]).unwrap_err();
+        let err = HttpPool::new(&loopback_template(), vec![]).unwrap_err();
         assert!(matches!(err, PoolError::Empty));
     }
 
     #[test]
     fn loopback_constructs() {
         let pool = HttpPool::new(
-            loopback_template(),
+            &loopback_template(),
             vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
         )
         .unwrap();
@@ -140,7 +147,7 @@ mod tests {
     async fn new_no_bind_dispatch_always_returns_slot_0() {
         let pool = HttpPool::new_no_bind(loopback_template()).unwrap();
         for _ in 0..5 {
-            let (slot, _) = pool.dispatch_async(PickHint::Stateless, |_| async { () }).await;
+            let (slot, ()) = pool.dispatch_async(PickHint::Stateless, |_| async {}).await;
             assert_eq!(slot, 0);
         }
     }
@@ -151,7 +158,7 @@ mod tests {
         // useless counter check. Six dispatches against 3 slots → slot
         // sequence 0, 1, 2, 0, 1, 2.
         let pool = HttpPool::new(
-            loopback_template(),
+            &loopback_template(),
             vec![
                 IpAddr::V4(Ipv4Addr::LOCALHOST),
                 IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -169,7 +176,7 @@ mod tests {
 
     #[tokio::test]
     async fn closure_result_propagates() {
-        let pool = HttpPool::new(loopback_template(), vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
+        let pool = HttpPool::new(&loopback_template(), vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
         let (slot, result) = pool.dispatch_async(PickHint::Stateless, |_| async { "hello" }).await;
         assert_eq!(slot, 0);
         assert_eq!(result, "hello");
