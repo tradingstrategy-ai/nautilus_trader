@@ -83,13 +83,22 @@ impl HttpPool {
 
     /// Pick a slot and return a reference to the underlying [`HttpClient`].
     ///
-    /// The `hint` parameter is accepted for API symmetry with `dispatch_async`
-    /// but `HttpPool` always round-robins stateless REST requests regardless
-    /// of hint.
+    /// The `hint` parameter must be `PickHint::Stateless` — `HttpPool` only
+    /// serves stateless REST; the wallet-private slot-0 pin lives in `WsPool`.
+    /// A non-`Stateless` hint trips a `debug_assert!`.
     ///
     /// This method is preferred over `dispatch_async` at call sites that need
     /// to `.await` the client directly (avoids async-closure lifetime issues).
-    pub fn pick_client(&self, _hint: PickHint<'_>) -> (usize, &HttpClient) {
+    pub fn pick_client(&self, hint: PickHint<'_>) -> (usize, &HttpClient) {
+        // Mirrors the same invariant `dispatch_async` enforces: `HttpPool` only
+        // serves stateless REST. A non-`Stateless` hint here is a routing bug
+        // at the call site (e.g. accidentally feeding a wallet-private hint
+        // into HTTP code) — fail loudly in debug rather than silently
+        // round-robining a request that should have been pinned.
+        debug_assert!(
+            matches!(hint, PickHint::Stateless),
+            "HttpPool::pick_client got non-Stateless hint"
+        );
         if self.slots.len() == 1 {
             return (0, &self.slots[0]);
         }
@@ -203,5 +212,43 @@ mod tests {
         let (slot, result) = pool.dispatch_async(PickHint::Stateless, |_| async { "hello" }).await;
         assert_eq!(slot, 0);
         assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn pick_client_singleton_returns_slot_0() {
+        // Singleton fast-path: pick_client must not touch the atomic counter.
+        let pool = HttpPool::new(&loopback_template(), vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
+        for _ in 0..5 {
+            let (slot, _client) = pool.pick_client(PickHint::Stateless);
+            assert_eq!(slot, 0);
+        }
+    }
+
+    #[test]
+    fn pick_client_round_robins_across_slots() {
+        // Mirrors `dispatch_returns_advancing_slot_index` but for the
+        // synchronous `pick_client` path used by the HL adapter.
+        let pool = HttpPool::new(
+            &loopback_template(),
+            vec![
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+            ],
+        )
+        .unwrap();
+        let slots: Vec<usize> = (0..6).map(|_| pool.pick_client(PickHint::Stateless).0).collect();
+        assert_eq!(slots, vec![0, 1, 2, 0, 1, 2]);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "HttpPool::pick_client got non-Stateless hint")]
+    fn pick_client_rejects_non_stateless_hint_in_debug() {
+        // A wallet-private hint must never land on an HTTP pool. In debug
+        // builds the `debug_assert!` trips; in release builds it would be a
+        // silent routing bug at the call site. Pin the failure mode here.
+        let pool = HttpPool::new(&loopback_template(), vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
+        let _ = pool.pick_client(PickHint::WalletPrivateChannel { channel: "userFills" });
     }
 }
