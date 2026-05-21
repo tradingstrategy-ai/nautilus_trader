@@ -3,9 +3,61 @@
 //! See `docs/superpowers/specs/2026-05-21-multi-ip-rest-ws-pool-design.md`
 //! in the nautilus-strategies repo for the design rationale.
 
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 use siphasher::sip::SipHasher13;
+
+use crate::ratelimiter::quota::Quota;
+
+#[derive(Debug, Clone, Copy)]
+pub enum PickHint<'a> {
+    /// Stateless REST — round-robin via internal counter.
+    Stateless,
+    /// HL channels keyed by wallet address (userFills, userFundings,
+    /// webData2, orderUpdates). Pin to slot 0 to avoid duplicate delivery
+    /// across IPs (see spec Open Question H1).
+    WalletPrivateChannel { channel: &'a str },
+    /// Public market-data channels. Sharded per `ShardMode`.
+    ///
+    /// `instrument` MUST be the raw HL symbol ("BTC"), NOT the NT
+    /// instrument ID ("BTC-USD-PERP.HYPERLIQUID") — the NT format has
+    /// changed across NT versions and would silently re-shard.
+    MarketDataChannel { instrument: &'a str, channel: &'a str },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShardMode {
+    /// Default. Per-instrument bucketing via slot_for_instrument.
+    /// Keeps all of an instrument's channels co-located.
+    Instrument,
+    /// AtomicUsize counter. No locality. Escape hatch.
+    RoundRobin,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PoolError {
+    #[error("pool constructed with zero IPs")]
+    Empty,
+    #[error("invalid IP address '{input}': {reason}")]
+    InvalidAddress { input: String, reason: String },
+    #[error("failed to bind to {address}: {cause}")]
+    BindFailed { address: std::net::IpAddr, cause: String },
+}
+
+/// Template carrying everything `HttpClient::new_with_local_addr` takes
+/// except `local_addr` itself, which is filled per-slot by `HttpPool::new`.
+/// HL adapter passes its `Self::default_headers()` and `HYPERLIQUID_REST_QUOTA`
+/// via this template to preserve HL-specific behavior across all pool slots.
+#[derive(Debug, Clone, Default)]
+pub struct HttpClientTemplate {
+    pub headers: HashMap<String, String>,
+    pub header_keys: Vec<String>,
+    pub keyed_quotas: Vec<(String, Quota)>,
+    pub default_quota: Option<Quota>,
+    pub timeout_secs: Option<u64>,
+    pub proxy_url: Option<String>,
+}
 
 /// Returns the slot index for an instrument, deterministic across process restarts.
 ///
@@ -29,6 +81,40 @@ pub fn slot_for_instrument(instrument: &str, n_slots: usize) -> usize {
     let mut hasher = SipHasher13::new_with_keys(0, 0);
     instrument.as_bytes().hash(&mut hasher);
     (hasher.finish() as usize) % n_slots
+}
+
+#[cfg(test)]
+mod type_tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn pickhint_variants_construct() {
+        let _h1 = PickHint::Stateless;
+        let _h2 = PickHint::WalletPrivateChannel { channel: "userFills" };
+        let _h3 = PickHint::MarketDataChannel { instrument: "BTC", channel: "l2Book@BTC" };
+    }
+
+    #[test]
+    fn shardmode_variants_construct() {
+        let _ = ShardMode::Instrument;
+        let _ = ShardMode::RoundRobin;
+    }
+
+    #[test]
+    fn pool_error_variants_construct() {
+        let _e1 = PoolError::Empty;
+        let _e2 = PoolError::InvalidAddress { input: "x".into(), reason: "y".into() };
+        let _e3 = PoolError::BindFailed {
+            address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            cause: "z".into(),
+        };
+    }
+
+    #[test]
+    fn http_client_template_default() {
+        let _t = HttpClientTemplate::default();
+    }
 }
 
 #[cfg(test)]
