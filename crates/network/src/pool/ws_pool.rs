@@ -65,6 +65,11 @@ impl WsPool {
     /// Clones the template per slot, sets `local_addr = Some(addr)` on each
     /// clone, and awaits `connect`. If any slot's connect fails, the whole
     /// pool construction fails (no partial pools).
+    ///
+    /// # Errors
+    ///
+    /// - Returns `PoolError::Empty` if `addresses` is empty.
+    /// - Returns `PoolError::BindFailed` if any slot's `WebSocketClient::connect` fails.
     pub async fn new(
         template: WebSocketConfig,
         args: WsConnectArgs,
@@ -85,7 +90,7 @@ impl WsPool {
                 args.ping_handler.clone(),
                 args.post_reconnection.clone(),
                 args.keyed_quotas.clone(),
-                args.default_quota.clone(),
+                args.default_quota,
             )
             .await
             .map_err(|e: WsError| PoolError::BindFailed {
