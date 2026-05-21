@@ -18,7 +18,9 @@ use std::{
     fs::File,
     hash::{Hash, Hasher},
     io::copy,
+    net::IpAddr,
     path::Path,
+    str::FromStr,
     time::Duration,
 };
 
@@ -118,7 +120,8 @@ impl HttpClient {
     /// built on top of `reqwest` and can be used for both synchronous and
     /// asynchronous HTTP requests.
     #[new]
-    #[pyo3(signature = (default_headers=HashMap::new(), header_keys=Vec::new(), keyed_quotas=Vec::new(), default_quota=None, timeout_secs=None, proxy_url=None))]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (default_headers=HashMap::new(), header_keys=Vec::new(), keyed_quotas=Vec::new(), default_quota=None, timeout_secs=None, proxy_url=None, local_addr=None))]
     pub fn py_new(
         default_headers: HashMap<String, String>,
         header_keys: Vec<String>,
@@ -126,14 +129,22 @@ impl HttpClient {
         default_quota: Option<Quota>,
         timeout_secs: Option<u64>,
         proxy_url: Option<String>,
+        local_addr: Option<String>,
     ) -> PyResult<Self> {
-        Self::new(
+        let local_addr_parsed = match local_addr {
+            Some(addr_str) => Some(IpAddr::from_str(&addr_str).map_err(|e| {
+                to_pyvalue_err(format!("Invalid local_addr '{addr_str}': {e}"))
+            })?),
+            None => None,
+        };
+        Self::new_with_local_addr(
             default_headers,
             header_keys,
             keyed_quotas,
             default_quota,
             timeout_secs,
             proxy_url,
+            local_addr_parsed,
         )
         .map_err(HttpClientError::into_py_err)
     }

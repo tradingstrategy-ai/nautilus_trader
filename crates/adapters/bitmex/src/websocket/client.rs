@@ -501,6 +501,7 @@ impl BitmexWebSocketClient {
             reconnect_jitter_ms: None,        // Use default
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            local_addr: None,
         };
 
         let keyed_quotas = vec![];

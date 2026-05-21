@@ -13,6 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+pub mod channels;
 pub mod client;
 pub mod codec;
 pub mod enums;

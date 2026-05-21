@@ -77,6 +77,9 @@ pub(super) enum AssetContextDataType {
 )]
 pub struct HyperliquidWebSocketClient {
     url: String,
+    /// Optional local source IP to bind outbound WebSocket connections to.
+    /// See [`WebSocketConfig::local_addr`] for semantics.
+    local_addr: Option<std::net::IpAddr>,
     connection_mode: Arc<ArcSwap<AtomicU8>>,
     signal: Arc<AtomicBool>,
     cmd_tx: Arc<tokio::sync::RwLock<tokio::sync::mpsc::UnboundedSender<HandlerCommand>>>,
@@ -95,6 +98,7 @@ impl Clone for HyperliquidWebSocketClient {
     fn clone(&self) -> Self {
         Self {
             url: self.url.clone(),
+            local_addr: self.local_addr,
             connection_mode: Arc::clone(&self.connection_mode),
             signal: Arc::clone(&self.signal),
             cmd_tx: Arc::clone(&self.cmd_tx),
@@ -120,6 +124,17 @@ impl HyperliquidWebSocketClient {
     ///
     /// The connection will be established when `connect()` is called.
     pub fn new(url: Option<String>, testnet: bool, account_id: Option<AccountId>) -> Self {
+        Self::new_with_local_addr(url, testnet, account_id, None)
+    }
+
+    /// Like [`new`](Self::new) but accepts an optional `local_addr` to pin outbound
+    /// WebSocket TCP connections to a specific source IP.
+    pub fn new_with_local_addr(
+        url: Option<String>,
+        testnet: bool,
+        account_id: Option<AccountId>,
+        local_addr: Option<std::net::IpAddr>,
+    ) -> Self {
         let url = url.unwrap_or_else(|| {
             if testnet {
                 "wss://api.hyperliquid-testnet.xyz/ws".to_string()
@@ -132,6 +147,7 @@ impl HyperliquidWebSocketClient {
         ))));
         Self {
             url,
+            local_addr,
             connection_mode,
             signal: Arc::new(AtomicBool::new(false)),
             auth_tracker: AuthTracker::new(),
@@ -170,6 +186,7 @@ impl HyperliquidWebSocketClient {
             reconnect_jitter_ms: Some(200),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            local_addr: self.local_addr,
         };
         let client =
             WebSocketClient::connect(cfg, Some(message_handler), None, None, vec![], None).await?;

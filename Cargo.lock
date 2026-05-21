@@ -5898,6 +5898,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_urlencoded",
+ "siphasher",
  "strum 0.28.0",
  "tempfile",
  "thiserror 2.0.18",

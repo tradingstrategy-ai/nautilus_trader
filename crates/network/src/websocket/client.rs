@@ -26,6 +26,7 @@
 use std::{
     collections::VecDeque,
     fmt::Debug,
+    net::{IpAddr, SocketAddr},
     sync::{
         Arc,
         atomic::{AtomicU8, Ordering},
@@ -209,7 +210,8 @@ impl WebSocketClientInner {
         let reconnect_max_attempts = config.reconnect_max_attempts;
 
         let (writer, reader) =
-            Self::connect_with_server(&config.url, config.headers.clone()).await?;
+            Self::connect_with_server(&config.url, config.headers.clone(), config.local_addr)
+                .await?;
 
         let connection_mode = Arc::new(AtomicU8::new(ConnectionMode::Active.as_u8()));
         let state_notify = Arc::new(tokio::sync::Notify::new());
@@ -276,7 +278,15 @@ impl WebSocketClientInner {
     }
 
     /// Connects with the server creating a tokio-tungstenite websocket stream.
-    /// Production version that uses `connect_async_with_config` convenience helper.
+    ///
+    /// When `local_addr` is `None`, uses the convenience helper
+    /// `connect_async_with_config` which lets the kernel pick the source IP.
+    ///
+    /// When `local_addr` is `Some(ip)`, performs a manual `TcpSocket::bind` to the
+    /// requested local address before connecting, then hands the stream to the
+    /// tungstenite handshake. This is the source-IP-pinning path used by adapters
+    /// that need to control which IP outbound traffic egresses from (e.g. when a
+    /// venue rate-limits by IP and the host has multiple IPs).
     ///
     /// # Errors
     ///
@@ -284,11 +294,15 @@ impl WebSocketClientInner {
     /// - The URL cannot be parsed into a valid client request.
     /// - Header values are invalid.
     /// - The WebSocket connection fails.
+    /// - When `local_addr` is set: the TCP socket cannot be created or bound to the
+    ///   requested local address, DNS resolution fails, the connection fails, or
+    ///   the TLS handshake fails (for `wss://` URLs).
     #[inline]
     #[cfg(not(feature = "turmoil"))]
     pub async fn connect_with_server(
         url: &str,
         headers: Vec<(String, String)>,
+        local_addr: Option<IpAddr>,
     ) -> Result<(MessageWriter, MessageReader), Error> {
         let mut request = url.into_client_request()?;
         let req_headers = request.headers_mut();
@@ -301,7 +315,75 @@ impl WebSocketClientInner {
             req_headers.insert(header_name, header_value);
         }
 
-        connect_async_with_config(request, None, true)
+        // Fast path: no source-IP pinning requested — use the standard helper.
+        let Some(local_addr) = local_addr else {
+            return connect_async_with_config(request, None, true)
+                .await
+                .map(|resp| resp.0.split());
+        };
+
+        // Slow path: bind outbound TCP to a specific source IP before connecting.
+        // Mirrors the turmoil branch below but uses tokio's TcpSocket so we can
+        // call .bind() with the requested local address.
+        use tokio::net::TcpSocket;
+        use tokio_tungstenite::{
+            client_async_tls, tungstenite::stream::Mode,
+        };
+
+        let uri = request.uri().clone();
+        let scheme = uri.scheme_str().unwrap_or("ws");
+        let host = uri
+            .host()
+            .ok_or_else(|| {
+                Error::Url(tokio_tungstenite::tungstenite::error::UrlError::NoHostName)
+            })?
+            .to_string();
+        let port = uri
+            .port_u16()
+            .unwrap_or_else(|| if scheme == "wss" { 443 } else { 80 });
+
+        let mode = if scheme == "wss" {
+            Mode::Tls
+        } else {
+            Mode::Plain
+        };
+
+        // Resolve the host to a SocketAddr, picking the first address whose
+        // family matches the requested local_addr (v4 with v4, v6 with v6).
+        let addrs = tokio::net::lookup_host((host.as_str(), port))
+            .await
+            .map_err(Error::Io)?;
+        let peer_addr = addrs
+            .into_iter()
+            .find(|a| match (a, local_addr) {
+                (SocketAddr::V4(_), IpAddr::V4(_)) | (SocketAddr::V6(_), IpAddr::V6(_)) => true,
+                _ => false,
+            })
+            .ok_or_else(|| {
+                Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::AddrNotAvailable,
+                    format!(
+                        "no address-family match for host '{host}' and local_addr {local_addr}"
+                    ),
+                ))
+            })?;
+
+        let socket = match local_addr {
+            IpAddr::V4(_) => TcpSocket::new_v4().map_err(Error::Io)?,
+            IpAddr::V6(_) => TcpSocket::new_v6().map_err(Error::Io)?,
+        };
+        socket
+            .bind(SocketAddr::new(local_addr, 0))
+            .map_err(Error::Io)?;
+        let tcp_stream = socket.connect(peer_addr).await.map_err(Error::Io)?;
+        if let Err(e) = tcp_stream.set_nodelay(true) {
+            log::warn!("Failed to enable TCP_NODELAY for socket client: {e:?}");
+        }
+
+        // `client_async_tls` takes the request and the underlying stream and
+        // performs both TLS (if needed) and the WebSocket handshake.
+        let _ = mode; // tungstenite::client_async_tls determines TLS via scheme
+        client_async_tls(request, tcp_stream)
             .await
             .map(|resp| resp.0.split())
     }
@@ -323,7 +405,12 @@ impl WebSocketClientInner {
     pub async fn connect_with_server(
         url: &str,
         headers: Vec<(String, String)>,
+        local_addr: Option<IpAddr>,
     ) -> Result<(MessageWriter, MessageReader), Error> {
+        // The turmoil simulator stream doesn't support real socket-level bind:
+        // it routes via a virtual network. `local_addr` is accepted for API
+        // symmetry with the production branch but is intentionally ignored.
+        let _ = local_addr;
         use rustls::ClientConfig;
         use tokio_rustls::TlsConnector;
 
@@ -424,8 +511,12 @@ impl WebSocketClientInner {
 
         tokio::time::timeout(self.reconnect_timeout, async {
             // Attempt to connect; abort early if a disconnect was requested
-            let (new_writer, reader) =
-                Self::connect_with_server(&self.config.url, self.config.headers.clone()).await?;
+            let (new_writer, reader) = Self::connect_with_server(
+                &self.config.url,
+                self.config.headers.clone(),
+                self.config.local_addr,
+            )
+            .await?;
 
             if ConnectionMode::from_atomic(&self.connection_mode).is_disconnect() {
                 log::debug!("Reconnect aborted mid-flight (after connect)");
@@ -937,8 +1028,12 @@ impl WebSocketClient {
         install_cryptographic_provider();
 
         // Create a single connection and split it, respecting configured headers
-        let (writer, reader) =
-            WebSocketClientInner::connect_with_server(&config.url, config.headers.clone()).await?;
+        let (writer, reader) = WebSocketClientInner::connect_with_server(
+            &config.url,
+            config.headers.clone(),
+            config.local_addr,
+        )
+        .await?;
 
         // Create inner without connecting (we'll provide the writer)
         let inner = WebSocketClientInner::new_with_writer(config, writer).await?;
@@ -1640,6 +1735,7 @@ mod tests {
             reconnect_jitter_ms: None,
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            local_addr: None,
         };
         WebSocketClient::connect(config, Some(Arc::new(|_| {})), None, None, vec![], None)
             .await
@@ -1684,6 +1780,7 @@ mod tests {
             reconnect_jitter_ms: None,
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            local_addr: None,
         };
         let res =
             WebSocketClient::connect(config, Some(Arc::new(|_| {})), None, None, vec![], None)
@@ -1730,6 +1827,7 @@ mod tests {
             reconnect_jitter_ms: None,
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            local_addr: None,
         };
 
         let client = WebSocketClient::connect(
@@ -1826,6 +1924,7 @@ mod rust_tests {
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            local_addr: None,
         };
 
         // Connect the client
@@ -1871,6 +1970,7 @@ mod rust_tests {
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            local_addr: None,
         };
 
         let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
@@ -1921,6 +2021,7 @@ mod rust_tests {
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            local_addr: None,
         };
 
         let (_reader, _client) = WebSocketClient::connect_stream(config, vec![], None, None)
@@ -1968,6 +2069,7 @@ mod rust_tests {
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            local_addr: None,
         };
 
         let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
@@ -2041,6 +2143,7 @@ mod rust_tests {
             reconnect_jitter_ms: Some(10),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            local_addr: None,
         };
 
         let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
@@ -2101,6 +2204,7 @@ mod rust_tests {
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            local_addr: None,
         };
 
         let (mut reader, client) = WebSocketClient::connect_stream(config, vec![], None, None)
@@ -2184,6 +2288,7 @@ mod rust_tests {
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            local_addr: None,
         };
 
         let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
@@ -2268,6 +2373,7 @@ mod rust_tests {
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            local_addr: None,
         };
 
         let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
@@ -2353,6 +2459,7 @@ mod rust_tests {
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            local_addr: None,
         };
 
         // Very restrictive rate limit: 1 request per second, burst of 1
@@ -2444,6 +2551,7 @@ mod rust_tests {
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            local_addr: None,
         };
 
         let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
@@ -2509,6 +2617,7 @@ mod rust_tests {
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            local_addr: None,
         };
 
         // Very restrictive rate limit: 1 request per 10 seconds
@@ -2586,6 +2695,7 @@ mod rust_tests {
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            local_addr: None,
         };
 
         // Pass None for message_handler - should be rejected
@@ -2634,6 +2744,7 @@ mod rust_tests {
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            local_addr: None,
         };
 
         // Create client directly via connect_url with no handler (stream mode)
@@ -2681,6 +2792,7 @@ mod rust_tests {
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: Some(1),
             idle_timeout_ms: Some(500),
+            local_addr: None,
         };
 
         let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
@@ -2742,6 +2854,7 @@ mod rust_tests {
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: Some(1),
             idle_timeout_ms: Some(1_000),
+            local_addr: None,
         };
 
         let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
@@ -2794,6 +2907,7 @@ mod rust_tests {
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            local_addr: None,
         };
 
         let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
@@ -2863,6 +2977,7 @@ mod rust_tests {
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            local_addr: None,
         };
 
         // Very restrictive: 1 req per 60 seconds
@@ -2957,6 +3072,7 @@ mod rust_tests {
             reconnect_jitter_ms: Some(0),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            local_addr: None,
         };
 
         let (_reader, client) = WebSocketClient::connect_stream(config, vec![], None, None)
@@ -3015,6 +3131,7 @@ mod rust_tests {
             reconnect_jitter_ms: None,
             reconnect_max_attempts: None,
             idle_timeout_ms: Some(0),
+            local_addr: None,
         };
 
         let result =

@@ -181,7 +181,7 @@ impl AsterFuturesExecutionClient {
 
         let clock = get_atomic_clock_realtime();
 
-        let http_client = AsterFuturesHttpClient::new(
+        let http_client = AsterFuturesHttpClient::new_with_local_addr(
             product_type,
             config.environment,
             clock,
@@ -192,6 +192,7 @@ impl AsterFuturesExecutionClient {
             None, // timeout_secs
             None, // proxy_url
             config.treat_expired_as_canceled,
+            config.local_addr,
         )
         .context("failed to construct Aster Futures HTTP client")?;
 

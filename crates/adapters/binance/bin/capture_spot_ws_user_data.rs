@@ -186,6 +186,7 @@ async fn main() -> anyhow::Result<()> {
         reconnect_jitter_ms: None,
         reconnect_max_attempts: Some(0),
         idle_timeout_ms: None,
+        local_addr: None,
     };
 
     let client = WebSocketClient::connect(

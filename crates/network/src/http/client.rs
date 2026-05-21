@@ -15,7 +15,9 @@
 
 //! HTTP client implementation with rate limiting and timeout support.
 
-use std::{borrow::Cow, collections::HashMap, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    borrow::Cow, collections::HashMap, net::IpAddr, str::FromStr, sync::Arc, time::Duration,
+};
 
 use nautilus_core::collections::into_ustr_vec;
 use nautilus_cryptography::providers::install_cryptographic_provider;
@@ -77,6 +79,40 @@ impl HttpClient {
         timeout_secs: Option<u64>,
         proxy_url: Option<String>,
     ) -> Result<Self, HttpClientError> {
+        Self::new_with_local_addr(
+            headers,
+            header_keys,
+            keyed_quotas,
+            default_quota,
+            timeout_secs,
+            proxy_url,
+            None,
+        )
+    }
+
+    /// Creates a new [`HttpClient`] instance with an optional local source-address binding.
+    ///
+    /// When `local_addr` is `Some(ip)`, all outbound TCP connections from this client
+    /// will originate from the given local IP. This is used to pin a process to a
+    /// specific source IP (e.g. for venues that rate-limit by source IP).
+    ///
+    /// When `local_addr` is `None`, the kernel selects the default source IP — behaviour
+    /// is identical to [`HttpClient::new`].
+    ///
+    /// # Errors
+    ///
+    /// - Returns `InvalidProxy` if the proxy URL is malformed.
+    /// - Returns `ClientBuildError` if building the underlying `reqwest::Client` fails.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_local_addr(
+        headers: HashMap<String, String>,
+        header_keys: Vec<String>,
+        keyed_quotas: Vec<(String, Quota)>,
+        default_quota: Option<Quota>,
+        timeout_secs: Option<u64>,
+        proxy_url: Option<String>,
+        local_addr: Option<IpAddr>,
+    ) -> Result<Self, HttpClientError> {
         install_cryptographic_provider();
 
         // Build default headers
@@ -108,6 +144,12 @@ impl HttpClient {
             let proxy = reqwest::Proxy::all(&proxy_url)
                 .map_err(|e| HttpClientError::InvalidProxy(format!("{proxy_url}: {e}")))?;
             client_builder = client_builder.proxy(proxy);
+        }
+
+        // Bind outbound socket to a specific local IP, when requested. The kernel
+        // would otherwise pick a default source address from the routing table.
+        if let Some(local_addr) = local_addr {
+            client_builder = client_builder.local_address(local_addr);
         }
 
         let client = client_builder
@@ -838,5 +880,250 @@ mod tests {
         let response = client.delete(url, None, None, None, None).await.unwrap();
 
         assert!(response.status.is_success());
+    }
+
+    // ---------- local_addr (source-IP pinning) ----------
+
+    #[rstest]
+    fn test_http_client_with_local_addr_none_matches_default() {
+        // `new_with_local_addr(..., None)` should behave identically to `new(...)`.
+        let a = HttpClient::new(HashMap::new(), vec![], vec![], None, None, None);
+        let b = HttpClient::new_with_local_addr(
+            HashMap::new(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(a.is_ok());
+        assert!(b.is_ok());
+    }
+
+    #[rstest]
+    fn test_http_client_with_local_addr_loopback_v4() {
+        // Binding to 127.0.0.1 must succeed on every host. We do not actually issue a
+        // request — we only assert that the reqwest client builds, which is sufficient
+        // to validate the local_address plumbing.
+        let local = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let result = HttpClient::new_with_local_addr(
+            HashMap::new(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            Some(local),
+        );
+        assert!(
+            result.is_ok(),
+            "expected client build to succeed with local_addr=127.0.0.1, was {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_http_client_local_addr_loopback_v4_request() {
+        // Boot an axum server on 127.0.0.1 and verify a client pinned to 127.0.0.1
+        // can complete a request end-to-end. This is the closest thing to an
+        // integration test we can run locally without a multi-IP host.
+        let addr = start_test_server().await.unwrap();
+        let url = format!("http://{addr}/get");
+        let client = HttpClient::new_with_local_addr(
+            HashMap::new(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        )
+        .unwrap();
+        let response = client.get(url, None, None, None, None).await.unwrap();
+        assert!(response.status.is_success());
+        assert_eq!(String::from_utf8_lossy(&response.body), "hello-world!");
+    }
+
+    #[tokio::test]
+    async fn test_http_client_local_addr_unbindable_v4_returns_io_error() {
+        // 240.0.0.1 is in the reserved 240/4 block — kernel refuses to bind it.
+        // We expect the request itself (not the build) to fail, because reqwest
+        // performs the bind on connect, not on builder.build().
+        let addr = start_test_server().await.unwrap();
+        let url = format!("http://{addr}/get");
+        let client = HttpClient::new_with_local_addr(
+            HashMap::new(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            Some(IpAddr::V4(std::net::Ipv4Addr::new(240, 0, 0, 1))),
+        )
+        .unwrap();
+        let result = client.get(url, None, None, None, None).await;
+        assert!(result.is_err(), "expected bind to 240.0.0.1 to fail");
+    }
+
+    /// Connection-reuse proof: multiple sequential requests through a client
+    /// with local_addr=127.0.0.1 all succeed. reqwest's connection pool is
+    /// per-host, so this exercises the pool reuse path with local_addr set.
+    /// If the pool silently dropped local_addr after the first request, we'd
+    /// see a behaviour change — we don't.
+    #[tokio::test]
+    async fn test_http_client_local_addr_connection_reuse_loopback() {
+        let addr = start_test_server().await.unwrap();
+        let url = format!("http://{addr}/get");
+        let client = HttpClient::new_with_local_addr(
+            HashMap::new(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        )
+        .unwrap();
+        // 10 sequential requests — exercises both first-connect and pool-reuse paths.
+        for i in 0..10 {
+            let resp = client
+                .get(url.clone(), None, None, None, None)
+                .await
+                .expect(&format!("request {i} should succeed"));
+            assert!(
+                resp.status.is_success(),
+                "request {i} returned non-success: {resp:?}"
+            );
+        }
+    }
+
+    /// Invalid IP input handling. The Python pyo3 binding parses `Option<String>`
+    /// to `IpAddr` via `IpAddr::from_str`. This test exercises the underlying
+    /// parser to confirm it rejects the values we expect to reject — and
+    /// accepts the values we expect to accept. (The pyo3 layer is tested
+    /// indirectly through the wheel build; for local verification we test
+    /// the parser directly.)
+    #[rstest]
+    fn test_local_addr_string_parsing() {
+        use std::str::FromStr;
+
+        // Valid IPs — must parse.
+        for valid in [
+            "127.0.0.1",
+            "10.0.0.5",
+            "192.168.1.1",
+            "0.0.0.0",
+            "255.255.255.255",
+            "::1",
+            "2001:db8::1",
+            "fe80::1",
+        ] {
+            assert!(
+                IpAddr::from_str(valid).is_ok(),
+                "{valid} should parse as a valid IpAddr"
+            );
+        }
+
+        // Invalid inputs — must reject.
+        for invalid in [
+            "",
+            " ",
+            "  ",
+            "not.an.ip",
+            "999.999.999.999",
+            "256.0.0.1",
+            "127.0.0",
+            "127.0.0.1.5",
+            "127.0.0.1:80", // host:port
+            "[::1]",        // bracketed (used in URLs, not IpAddr)
+            "::g",          // invalid hex
+            "0xFF.0xFF.0xFF.0xFF", // hex format not accepted by IpAddr::from_str
+            "localhost",
+        ] {
+            assert!(
+                IpAddr::from_str(invalid).is_err(),
+                "{invalid:?} should NOT parse as an IpAddr"
+            );
+        }
+    }
+
+    /// Connection-reuse failure proof: multiple sequential requests through a
+    /// client with local_addr=240.0.0.1 (unbindable) all fail. If the pool
+    /// silently fell back to no local_addr after the first failure, we'd see
+    /// the second request succeed. It doesn't — every request fails.
+    #[tokio::test]
+    async fn test_http_client_local_addr_connection_reuse_unbindable() {
+        let addr = start_test_server().await.unwrap();
+        let url = format!("http://{addr}/get");
+        let client = HttpClient::new_with_local_addr(
+            HashMap::new(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            Some(IpAddr::V4(std::net::Ipv4Addr::new(240, 0, 0, 1))),
+        )
+        .unwrap();
+        for i in 0..3 {
+            let result = client.get(url.clone(), None, None, None, None).await;
+            assert!(
+                result.is_err(),
+                "request {i} should fail with unbindable local_addr, was {result:?}"
+            );
+        }
+    }
+
+    /// Strong proof: a control client (local_addr=None) succeeds against the
+    /// same URL while a treated client (local_addr=240.0.0.1) fails. Eliminates
+    /// the alternative explanation "request would have failed for another
+    /// reason". The only difference between the two is the local_addr.
+    #[tokio::test]
+    async fn test_http_client_local_addr_changes_behaviour_vs_none() {
+        let addr = start_test_server().await.unwrap();
+        let url = format!("http://{addr}/get");
+
+        // Control: no local_addr — must succeed.
+        let control = HttpClient::new_with_local_addr(
+            HashMap::new(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let control_result = control.get(url.clone(), None, None, None, None).await;
+        assert!(
+            control_result.is_ok(),
+            "control (local_addr=None) should succeed, was {control_result:?}"
+        );
+
+        // Treated: bind to an unbindable IP — must fail.
+        let treated = HttpClient::new_with_local_addr(
+            HashMap::new(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            Some(IpAddr::V4(std::net::Ipv4Addr::new(240, 0, 0, 1))),
+        )
+        .unwrap();
+        let treated_result = treated.get(url, None, None, None, None).await;
+        assert!(
+            treated_result.is_err(),
+            "treated (local_addr=240.0.0.1) should fail, was {treated_result:?}"
+        );
+
+        // The strong proof is differential: same URL, same server, same client
+        // construction — only local_addr differs. Control succeeded, treated
+        // failed. That is only possible if local_addr is being honored.
+        //
+        // Reqwest wraps the underlying bind failure in a generic "error
+        // sending request" so we can't grep the message reliably across
+        // platforms — the differential result is the proof.
+        let _ = treated_result.unwrap_err();
     }
 }

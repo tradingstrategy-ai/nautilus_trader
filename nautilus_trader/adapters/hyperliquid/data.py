@@ -120,6 +120,7 @@ class HyperliquidDataClient(LiveMarketDataClient):
         self._ws_client = nautilus_pyo3.HyperliquidWebSocketClient(
             url=config.base_url_ws,
             testnet=config.testnet,
+            local_addr=config.local_addr,
         )
 
     @property

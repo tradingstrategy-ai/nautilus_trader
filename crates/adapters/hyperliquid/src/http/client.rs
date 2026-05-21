@@ -49,7 +49,8 @@ use nautilus_model::{
     types::{AccountBalance, Currency, Money, Price, Quantity},
 };
 use nautilus_network::{
-    http::{HttpClient, HttpClientError, HttpResponse, Method, USER_AGENT},
+    http::{HttpClientError, HttpResponse, Method, USER_AGENT},
+    pool::{HttpClientTemplate, HttpPool, PickHint},
     ratelimiter::quota::Quota,
 };
 use rust_decimal::Decimal;
@@ -122,7 +123,7 @@ pub static HYPERLIQUID_REST_QUOTA: LazyLock<Quota> =
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.hyperliquid")
 )]
 pub struct HyperliquidRawHttpClient {
-    client: HttpClient,
+    pool: Arc<HttpPool>,
     is_testnet: bool,
     base_info: String,
     base_exchange: String,
@@ -136,6 +137,33 @@ pub struct HyperliquidRawHttpClient {
 }
 
 impl HyperliquidRawHttpClient {
+    /// Build an `HttpClientTemplate` carrying HL-specific headers + REST quota.
+    fn make_template(timeout_secs: u64, proxy_url: Option<String>) -> HttpClientTemplate {
+        HttpClientTemplate {
+            headers: Self::default_headers(),
+            header_keys: vec![],
+            keyed_quotas: vec![],
+            default_quota: Some(*HYPERLIQUID_REST_QUOTA),
+            timeout_secs: Some(timeout_secs),
+            proxy_url,
+        }
+    }
+
+    /// Build a pool for a single optional IP (`None` → kernel default / no bind).
+    fn make_pool_single(
+        timeout_secs: u64,
+        proxy_url: Option<String>,
+        local_addr: Option<std::net::IpAddr>,
+    ) -> std::result::Result<Arc<HttpPool>, HttpClientError> {
+        let template = Self::make_template(timeout_secs, proxy_url);
+        let pool = match local_addr {
+            Some(addr) => HttpPool::new(&template, vec![addr]),
+            None => HttpPool::new_no_bind(template),
+        }
+        .map_err(|e| HttpClientError::Error(e.to_string()))?;
+        Ok(Arc::new(pool))
+    }
+
     /// Creates a new [`HyperliquidRawHttpClient`] for public endpoints only.
     ///
     /// # Errors
@@ -146,15 +174,53 @@ impl HyperliquidRawHttpClient {
         timeout_secs: u64,
         proxy_url: Option<String>,
     ) -> std::result::Result<Self, HttpClientError> {
+        Self::new_with_local_addr(is_testnet, timeout_secs, proxy_url, None)
+    }
+
+    /// Creates a new [`HyperliquidRawHttpClient`] for public endpoints with an optional
+    /// `local_addr` to pin outbound TCP connections to a specific source IP.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP client cannot be created.
+    pub fn new_with_local_addr(
+        is_testnet: bool,
+        timeout_secs: u64,
+        proxy_url: Option<String>,
+        local_addr: Option<std::net::IpAddr>,
+    ) -> std::result::Result<Self, HttpClientError> {
+        let pool = Self::make_pool_single(timeout_secs, proxy_url, local_addr)?;
         Ok(Self {
-            client: HttpClient::new(
-                Self::default_headers(),
-                vec![],
-                vec![],
-                Some(*HYPERLIQUID_REST_QUOTA),
-                Some(timeout_secs),
-                proxy_url,
-            )?,
+            pool,
+            is_testnet,
+            base_info: info_url(is_testnet).to_string(),
+            base_exchange: exchange_url(is_testnet).to_string(),
+            signer: None,
+            nonce_manager: None,
+            vault_address: None,
+            rest_limiter: Arc::new(WeightedLimiter::per_minute(1200)),
+            rate_limit_backoff_base: Duration::from_millis(125),
+            rate_limit_backoff_cap: Duration::from_secs(5),
+            rate_limit_max_attempts_info: 3,
+        })
+    }
+
+    /// Construct with a multi-IP REST pool. Round-robins requests across IPs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `addresses` is empty or if any `HttpClient` construction fails.
+    pub fn new_with_pool(
+        is_testnet: bool,
+        timeout_secs: u64,
+        proxy_url: Option<String>,
+        addresses: Vec<std::net::IpAddr>,
+    ) -> std::result::Result<Self, HttpClientError> {
+        let template = Self::make_template(timeout_secs, proxy_url);
+        let pool = HttpPool::new(&template, addresses)
+            .map_err(|e| HttpClientError::Error(e.to_string()))?;
+        Ok(Self {
+            pool: Arc::new(pool),
             is_testnet,
             base_info: info_url(is_testnet).to_string(),
             base_exchange: exchange_url(is_testnet).to_string(),
@@ -179,18 +245,26 @@ impl HyperliquidRawHttpClient {
         timeout_secs: u64,
         proxy_url: Option<String>,
     ) -> std::result::Result<Self, HttpClientError> {
+        Self::with_credentials_and_local_addr(secrets, timeout_secs, proxy_url, None)
+    }
+
+    /// Creates a new [`HyperliquidRawHttpClient`] with credentials and an optional
+    /// `local_addr` to pin outbound TCP connections to a specific source IP.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP client cannot be created.
+    pub fn with_credentials_and_local_addr(
+        secrets: &Secrets,
+        timeout_secs: u64,
+        proxy_url: Option<String>,
+        local_addr: Option<std::net::IpAddr>,
+    ) -> std::result::Result<Self, HttpClientError> {
         let signer = HyperliquidEip712Signer::new(secrets.private_key.clone());
         let nonce_manager = Arc::new(NonceManager::new());
-
+        let pool = Self::make_pool_single(timeout_secs, proxy_url, local_addr)?;
         Ok(Self {
-            client: HttpClient::new(
-                Self::default_headers(),
-                vec![],
-                vec![],
-                Some(*HYPERLIQUID_REST_QUOTA),
-                Some(timeout_secs),
-                proxy_url,
-            )?,
+            pool,
             is_testnet: secrets.is_testnet,
             base_info: info_url(secrets.is_testnet).to_string(),
             base_exchange: exchange_url(secrets.is_testnet).to_string(),
@@ -238,10 +312,101 @@ impl HyperliquidRawHttpClient {
         timeout_secs: u64,
         proxy_url: Option<String>,
     ) -> Result<Self> {
+        Self::from_credentials_with_local_addr(
+            private_key,
+            vault_address,
+            is_testnet,
+            timeout_secs,
+            proxy_url,
+            None,
+        )
+    }
+
+    /// Creates a new [`HyperliquidRawHttpClient`] with credentials and an optional
+    /// `local_addr` for source-IP pinning.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Auth`] if the private key is invalid or cannot be parsed.
+    pub fn from_credentials_with_local_addr(
+        private_key: &str,
+        vault_address: Option<&str>,
+        is_testnet: bool,
+        timeout_secs: u64,
+        proxy_url: Option<String>,
+        local_addr: Option<std::net::IpAddr>,
+    ) -> Result<Self> {
         let secrets = Secrets::from_private_key(private_key, vault_address, is_testnet)
             .map_err(|e| Error::auth(format!("invalid credentials: {e}")))?;
-        Self::with_credentials(&secrets, timeout_secs, proxy_url)
+        Self::with_credentials_and_local_addr(&secrets, timeout_secs, proxy_url, local_addr)
             .map_err(|e| Error::auth(format!("Failed to create HTTP client: {e}")))
+    }
+
+    /// Like [`from_credentials_with_local_addr`](Self::from_credentials_with_local_addr)
+    /// but builds a multi-IP REST pool. Round-robins requests across `addresses`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Auth`] if the private key is invalid or the HTTP client
+    /// pool cannot be constructed.
+    pub fn from_credentials_with_pool(
+        private_key: &str,
+        vault_address: Option<&str>,
+        is_testnet: bool,
+        timeout_secs: u64,
+        proxy_url: Option<String>,
+        addresses: Vec<std::net::IpAddr>,
+    ) -> Result<Self> {
+        let secrets = Secrets::from_private_key(private_key, vault_address, is_testnet)
+            .map_err(|e| Error::auth(format!("invalid credentials: {e}")))?;
+        Self::with_credentials_and_pool(&secrets, timeout_secs, proxy_url, addresses)
+            .map_err(|e| Error::auth(format!("Failed to create HTTP client: {e}")))
+    }
+
+    /// Like [`with_credentials_and_local_addr`](Self::with_credentials_and_local_addr)
+    /// but builds a multi-IP REST pool. Round-robins requests across `addresses`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP client pool cannot be constructed.
+    pub fn with_credentials_and_pool(
+        secrets: &Secrets,
+        timeout_secs: u64,
+        proxy_url: Option<String>,
+        addresses: Vec<std::net::IpAddr>,
+    ) -> std::result::Result<Self, HttpClientError> {
+        let signer = HyperliquidEip712Signer::new(secrets.private_key.clone());
+        let nonce_manager = Arc::new(NonceManager::new());
+        let pool = Self::make_pool_multi(timeout_secs, proxy_url, addresses)?;
+        Ok(Self {
+            pool,
+            is_testnet: secrets.is_testnet,
+            base_info: info_url(secrets.is_testnet).to_string(),
+            base_exchange: exchange_url(secrets.is_testnet).to_string(),
+            signer: Some(signer),
+            nonce_manager: Some(nonce_manager),
+            vault_address: secrets.vault_address,
+            rest_limiter: Arc::new(WeightedLimiter::per_minute(1200)),
+            rate_limit_backoff_base: Duration::from_millis(125),
+            rate_limit_backoff_cap: Duration::from_secs(5),
+            rate_limit_max_attempts_info: 3,
+        })
+    }
+
+    /// Internal: build a multi-slot pool from a non-empty IP list.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `addresses` is empty or if any `HttpClient` construction fails.
+    fn make_pool_multi(
+        timeout_secs: u64,
+        proxy_url: Option<String>,
+        addresses: Vec<std::net::IpAddr>,
+    ) -> std::result::Result<Arc<HttpPool>, HttpClientError> {
+        let template = Self::make_template(timeout_secs, proxy_url);
+        let pool = HttpPool::new(&template, addresses)
+            .map_err(|e| HttpClientError::Error(e.to_string()))?;
+        Ok(Arc::new(pool))
     }
 
     /// Configure rate limiting parameters (chainable).
@@ -498,22 +663,15 @@ impl HyperliquidRawHttpClient {
     }
 
     async fn http_roundtrip_info(&self, request: &InfoRequest) -> Result<HttpResponse> {
-        let url = &self.base_info;
+        let url = self.base_info.clone();
         let body = serde_json::to_value(request).map_err(Error::Serde)?;
         let body_bytes = serde_json::to_string(&body)
             .map_err(Error::Serde)?
             .into_bytes();
 
-        self.client
-            .request(
-                Method::POST,
-                url.clone(),
-                None,
-                None,
-                Some(body_bytes),
-                None,
-                None,
-            )
+        let (_slot, client) = self.pool.pick_client(PickHint::Stateless);
+        client
+            .request(Method::POST, url, None, None, Some(body_bytes), None, None)
             .await
             .map_err(Error::from_http_client)
     }
@@ -727,25 +885,15 @@ impl HyperliquidRawHttpClient {
     where
         T: serde::Serialize,
     {
-        let url = &self.base_exchange;
+        let url = self.base_exchange.clone();
         let body = serde_json::to_string(&request).map_err(Error::Serde)?;
         let body_bytes = body.into_bytes();
 
-        let response = self
-            .client
-            .request(
-                Method::POST,
-                url.clone(),
-                None,
-                None,
-                Some(body_bytes),
-                None,
-                None,
-            )
+        let (_slot, client) = self.pool.pick_client(PickHint::Stateless);
+        client
+            .request(Method::POST, url, None, None, Some(body_bytes), None, None)
             .await
-            .map_err(Error::from_http_client)?;
-
-        Ok(response)
+            .map_err(Error::from_http_client)
     }
 }
 
@@ -800,7 +948,27 @@ impl HyperliquidHttpClient {
         timeout_secs: u64,
         proxy_url: Option<String>,
     ) -> std::result::Result<Self, HttpClientError> {
-        let raw_client = HyperliquidRawHttpClient::new(is_testnet, timeout_secs, proxy_url)?;
+        Self::new_with_local_addr(is_testnet, timeout_secs, proxy_url, None)
+    }
+
+    /// Creates a new [`HyperliquidHttpClient`] for public endpoints with an optional
+    /// `local_addr` to pin outbound TCP connections to a specific source IP.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP client cannot be created.
+    pub fn new_with_local_addr(
+        is_testnet: bool,
+        timeout_secs: u64,
+        proxy_url: Option<String>,
+        local_addr: Option<std::net::IpAddr>,
+    ) -> std::result::Result<Self, HttpClientError> {
+        let raw_client = HyperliquidRawHttpClient::new_with_local_addr(
+            is_testnet,
+            timeout_secs,
+            proxy_url,
+            local_addr,
+        )?;
         Ok(Self::from_raw(raw_client))
     }
 
@@ -814,8 +982,27 @@ impl HyperliquidHttpClient {
         timeout_secs: u64,
         proxy_url: Option<String>,
     ) -> std::result::Result<Self, HttpClientError> {
-        let raw_client =
-            HyperliquidRawHttpClient::with_credentials(secrets, timeout_secs, proxy_url)?;
+        Self::with_secrets_and_local_addr(secrets, timeout_secs, proxy_url, None)
+    }
+
+    /// Creates a new [`HyperliquidHttpClient`] with credentials and an optional
+    /// `local_addr` to pin outbound TCP connections to a specific source IP.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP client cannot be created.
+    pub fn with_secrets_and_local_addr(
+        secrets: &Secrets,
+        timeout_secs: u64,
+        proxy_url: Option<String>,
+        local_addr: Option<std::net::IpAddr>,
+    ) -> std::result::Result<Self, HttpClientError> {
+        let raw_client = HyperliquidRawHttpClient::with_credentials_and_local_addr(
+            secrets,
+            timeout_secs,
+            proxy_url,
+            local_addr,
+        )?;
         Ok(Self::from_raw(raw_client))
     }
 
@@ -895,6 +1082,33 @@ impl HyperliquidHttpClient {
         timeout_secs: u64,
         proxy_url: Option<String>,
     ) -> Result<Self> {
+        Self::with_credentials_and_local_addr(
+            private_key,
+            vault_address,
+            account_address,
+            is_testnet,
+            timeout_secs,
+            proxy_url,
+            None,
+        )
+    }
+
+    /// Like [`with_credentials`](Self::with_credentials) but accepts an optional
+    /// `local_addr` to pin outbound TCP connections to a specific source IP.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Auth`] if credentials are invalid.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_credentials_and_local_addr(
+        private_key: Option<String>,
+        vault_address: Option<String>,
+        account_address: Option<String>,
+        is_testnet: bool,
+        timeout_secs: u64,
+        proxy_url: Option<String>,
+        local_addr: Option<std::net::IpAddr>,
+    ) -> Result<Self> {
         // Determine which env vars to use based on is_testnet
         let pk_env_var = if is_testnet {
             "HYPERLIQUID_TESTNET_PK"
@@ -927,12 +1141,13 @@ impl HyperliquidHttpClient {
 
         match resolved_pk {
             Some(pk) => {
-                let raw_client = HyperliquidRawHttpClient::from_credentials(
+                let raw_client = HyperliquidRawHttpClient::from_credentials_with_local_addr(
                     &pk,
                     resolved_vault.as_deref(),
                     is_testnet,
                     timeout_secs,
                     proxy_url,
+                    local_addr,
                 )?;
                 Ok(Self {
                     inner: Arc::new(raw_client),
@@ -948,8 +1163,80 @@ impl HyperliquidHttpClient {
             }
             None => {
                 // No credentials available, create unauthenticated client
-                Self::new(is_testnet, timeout_secs, proxy_url)
+                Self::new_with_local_addr(is_testnet, timeout_secs, proxy_url, local_addr)
                     .map_err(|e| Error::auth(format!("Failed to create HTTP client: {e}")))
+            }
+        }
+    }
+
+    /// Like [`with_credentials_and_local_addr`](Self::with_credentials_and_local_addr)
+    /// but uses a multi-IP REST pool. Round-robins requests across `addresses`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Auth`] if credentials are invalid or the pool can't be constructed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_credentials_and_pool(
+        private_key: Option<String>,
+        vault_address: Option<String>,
+        account_address: Option<String>,
+        is_testnet: bool,
+        timeout_secs: u64,
+        proxy_url: Option<String>,
+        addresses: Vec<std::net::IpAddr>,
+    ) -> Result<Self> {
+        let pk_env_var = if is_testnet {
+            "HYPERLIQUID_TESTNET_PK"
+        } else {
+            "HYPERLIQUID_PK"
+        };
+        let vault_env_var = if is_testnet {
+            "HYPERLIQUID_TESTNET_VAULT"
+        } else {
+            "HYPERLIQUID_VAULT"
+        };
+
+        let resolved_pk = match private_key {
+            Some(pk) => Some(pk),
+            None => env::var(pk_env_var).ok(),
+        };
+        let resolved_vault = match vault_address {
+            Some(vault) => Some(vault),
+            None => env::var(vault_env_var).ok(),
+        };
+        let resolved_account_address = match account_address {
+            Some(addr) => Some(addr),
+            None => env::var("HYPERLIQUID_ACCOUNT_ADDRESS").ok(),
+        };
+
+        match resolved_pk {
+            Some(pk) => {
+                let raw_client = HyperliquidRawHttpClient::from_credentials_with_pool(
+                    &pk,
+                    resolved_vault.as_deref(),
+                    is_testnet,
+                    timeout_secs,
+                    proxy_url,
+                    addresses,
+                )?;
+                Ok(Self {
+                    inner: Arc::new(raw_client),
+                    clock: get_atomic_clock_realtime(),
+                    instruments: Arc::new(AtomicMap::new()),
+                    instruments_by_coin: Arc::new(AtomicMap::new()),
+                    asset_indices: Arc::new(AtomicMap::new()),
+                    spot_fill_coins: Arc::new(AtomicMap::new()),
+                    account_id: None,
+                    account_address: resolved_account_address,
+                    normalize_prices: true,
+                })
+            }
+            None => {
+                // No credentials — unauthenticated client via Raw new_with_pool.
+                let raw_client =
+                    HyperliquidRawHttpClient::new_with_pool(is_testnet, timeout_secs, proxy_url, addresses)
+                        .map_err(|e| Error::auth(format!("Failed to create HTTP client: {e}")))?;
+                Ok(Self::from_raw(raw_client))
             }
         }
     }
@@ -2795,5 +3082,164 @@ mod tests {
             client.get_or_create_instrument(&Ustr::from("vntls:vCURSOR"), None);
         assert!(retrieved_without_type.is_some());
         assert_eq!(retrieved_without_type.unwrap().id(), instrument.id());
+    }
+
+    // ---------- local_addr plumbing ----------
+    //
+    // These tests confirm that local_addr flows from
+    // HyperliquidHttpClient::new_with_local_addr through to the underlying
+    // HttpClient correctly. They mirror the differential pattern used in
+    // network::http::client tests: same construction except for local_addr,
+    // observe different behaviour.
+
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[rstest]
+    fn test_hl_http_client_local_addr_none_equivalent_to_new() {
+        // Public constructor with no local_addr should be equivalent to the
+        // non-local_addr constructor — both must build successfully.
+        let a = HyperliquidHttpClient::new(true, 60, None);
+        let b = HyperliquidHttpClient::new_with_local_addr(true, 60, None, None);
+        assert!(a.is_ok());
+        assert!(b.is_ok());
+    }
+
+    #[rstest]
+    fn test_hl_http_client_local_addr_loopback_builds() {
+        // 127.0.0.1 is always bindable; the client must build cleanly.
+        let result = HyperliquidHttpClient::new_with_local_addr(
+            true,
+            60,
+            None,
+            Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        );
+        assert!(
+            result.is_ok(),
+            "expected client to build with local_addr=127.0.0.1, was {result:?}"
+        );
+    }
+
+    #[rstest]
+    fn test_hl_http_client_local_addr_unbindable_still_builds() {
+        // The reqwest builder accepts any IpAddr — bind failure happens at
+        // connect time, not at client construction. So this also builds OK;
+        // a real request against the venue would fail with EADDRNOTAVAIL.
+        let result = HyperliquidHttpClient::new_with_local_addr(
+            true,
+            60,
+            None,
+            Some(IpAddr::V4(Ipv4Addr::new(240, 0, 0, 1))),
+        );
+        assert!(
+            result.is_ok(),
+            "client construction shouldn't fail at build time even for unbindable IP, was {result:?}"
+        );
+    }
+
+    // ---------- HttpPool-backed constructor tests ----------
+
+    #[test]
+    fn raw_http_client_new_with_pool_loopback() {
+        use super::HyperliquidRawHttpClient;
+        let result = HyperliquidRawHttpClient::new_with_pool(
+            true,
+            60,
+            None,
+            vec![
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+            ],
+        );
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn raw_http_client_new_with_pool_empty_errors() {
+        use super::HyperliquidRawHttpClient;
+        let result = HyperliquidRawHttpClient::new_with_pool(true, 60, None, vec![]);
+        assert!(result.is_err());
+    }
+}
+
+/// Parse a list of IP strings into `Vec<IpAddr>`, returning `Err(String)` on failure.
+///
+/// Pure-Rust helper (no pyo3 dependency) that can be unit-tested without the
+/// `python` feature. The pyo3 wrapper in `python/http.rs` calls this and maps
+/// the `String` error into a `PyErr`.
+///
+/// Empty strings and whitespace-only entries are silently skipped.
+///
+/// # Errors
+///
+/// Returns a `String` error message if any non-empty entry cannot be parsed as
+/// an [`IpAddr`].
+pub(crate) fn parse_addr_list(
+    field_name: &str,
+    raw: &Option<Vec<String>>,
+) -> std::result::Result<Vec<std::net::IpAddr>, String> {
+    let Some(list) = raw else {
+        return Ok(Vec::new());
+    };
+    list.iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<std::net::IpAddr>()
+                .map_err(|e| format!("Invalid {field_name} entry '{s}': {e}"))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod addr_list_tests {
+    use super::parse_addr_list;
+
+    #[test]
+    fn parse_addr_list_none_returns_empty() {
+        assert!(parse_addr_list("test", &None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_addr_list_empty_strings_filtered() {
+        let input = Some(vec!["".to_string(), "  ".to_string()]);
+        assert!(parse_addr_list("test", &input).unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_addr_list_parses_valid_ips() {
+        let input = Some(vec!["127.0.0.1".to_string(), "10.0.0.1".to_string()]);
+        let result = parse_addr_list("test", &input).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].to_string(), "127.0.0.1");
+        assert_eq!(result[1].to_string(), "10.0.0.1");
+    }
+
+    #[test]
+    fn parse_addr_list_trims_whitespace() {
+        let input = Some(vec![" 127.0.0.1 ".to_string()]);
+        let result = parse_addr_list("test", &input).unwrap();
+        assert_eq!(result[0].to_string(), "127.0.0.1");
+    }
+
+    #[test]
+    fn parse_addr_list_rejects_garbage() {
+        let input = Some(vec!["not.an.ip".to_string()]);
+        let err = parse_addr_list("test", &input).unwrap_err();
+        assert!(
+            err.contains("Invalid test entry 'not.an.ip'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_addr_list_drops_empties_keeps_valid() {
+        let input = Some(vec![
+            "".to_string(),
+            "127.0.0.1".to_string(),
+            "  ".to_string(),
+        ]);
+        let result = parse_addr_list("test", &input).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].to_string(), "127.0.0.1");
     }
 }

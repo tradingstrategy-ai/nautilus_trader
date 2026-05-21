@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::collections::HashMap;
+use std::{collections::HashMap, str::FromStr};
 
 use nautilus_core::python::{IntoPyObjectNautilusExt, to_pyvalue_err};
 use nautilus_model::{
@@ -31,7 +31,10 @@ use nautilus_model::{
 use pyo3::{prelude::*, types::PyList};
 use serde_json::to_string;
 
-use crate::http::{client::HyperliquidHttpClient, parse::HyperliquidMarketType};
+use crate::http::{
+    client::{HyperliquidHttpClient, parse_addr_list},
+    parse::HyperliquidMarketType,
+};
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
@@ -42,7 +45,20 @@ impl HyperliquidHttpClient {
     /// with Nautilus domain types. It maintains an instrument cache and handles conversions
     /// between Hyperliquid API responses and Nautilus domain models.
     #[new]
-    #[pyo3(signature = (private_key=None, vault_address=None, account_address=None, is_testnet=false, timeout_secs=60, proxy_url=None, normalize_prices=true))]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        private_key=None,
+        vault_address=None,
+        account_address=None,
+        is_testnet=false,
+        timeout_secs=60,
+        proxy_url=None,
+        normalize_prices=true,
+        local_addr=None,
+        local_addrs_rest=None,
+        local_addrs_ws=None,
+        ws_shard_by=None,
+    ))]
     fn py_new(
         private_key: Option<String>,
         vault_address: Option<String>,
@@ -51,15 +67,80 @@ impl HyperliquidHttpClient {
         timeout_secs: u64,
         proxy_url: Option<String>,
         normalize_prices: bool,
+        local_addr: Option<String>,
+        local_addrs_rest: Option<Vec<String>>,
+        local_addrs_ws: Option<Vec<String>>,
+        ws_shard_by: Option<String>,
     ) -> PyResult<Self> {
-        let mut client = Self::with_credentials(
-            private_key,
-            vault_address,
-            account_address,
-            is_testnet,
-            timeout_secs,
-            proxy_url,
-        )
+        // Parse plural REST addresses.
+        // Precedence rule:
+        //   local_addrs_rest (plural, multi-IP pool)  OVERRIDES
+        //   local_addr        (singular, single-IP)
+        //
+        // If neither is set → no source-IP binding (kernel default).
+        let rest_addrs = resolve_addr_list("local_addrs_rest", &local_addrs_rest)?;
+        let single_addr = match &local_addr {
+            Some(s) if !s.trim().is_empty() => Some(
+                std::net::IpAddr::from_str(s.trim())
+                    .map_err(|e| to_pyvalue_err(format!("Invalid local_addr '{s}': {e}")))?,
+            ),
+            _ => None,
+        };
+
+        // local_addrs_ws and ws_shard_by are reserved for a follow-up PR
+        // implementing multi-IP WS pooling. Validate the shapes so operators
+        // get an early error on malformed input, but don't actually wire
+        // anything up yet — the current WS code path uses the single-IP
+        // local_addr field.
+        if let Some(addrs) = &local_addrs_ws {
+            for s in addrs {
+                let s = s.trim();
+                if !s.is_empty() {
+                    std::net::IpAddr::from_str(s).map_err(|e| {
+                        to_pyvalue_err(format!("Invalid local_addrs_ws entry '{s}': {e}"))
+                    })?;
+                }
+            }
+            if addrs.iter().any(|s| !s.trim().is_empty()) {
+                log::warn!(
+                    "local_addrs_ws is set but WS multi-IP pooling is not yet implemented. \
+                     The WS connection will use the single-IP local_addr field (or kernel default) \
+                     for now. WS pooling is tracked as a follow-up PR."
+                );
+            }
+        }
+        if let Some(mode) = &ws_shard_by {
+            let mode = mode.trim();
+            if !mode.is_empty() && mode != "instrument" && mode != "round_robin" {
+                return Err(to_pyvalue_err(format!(
+                    "Unknown ws_shard_by '{mode}', expected: instrument, round_robin"
+                )));
+            }
+            // Even if valid, ws_shard_by has no effect until WS pooling lands.
+        }
+
+        let mut client = if !rest_addrs.is_empty() {
+            // Multi-IP REST pool (overrides singular local_addr if both set).
+            Self::with_credentials_and_pool(
+                private_key,
+                vault_address,
+                account_address,
+                is_testnet,
+                timeout_secs,
+                proxy_url,
+                rest_addrs,
+            )
+        } else {
+            Self::with_credentials_and_local_addr(
+                private_key,
+                vault_address,
+                account_address,
+                is_testnet,
+                timeout_secs,
+                proxy_url,
+                single_addr,
+            )
+        }
         .map_err(to_pyvalue_err)?;
         client.set_normalize_prices(normalize_prices);
         Ok(client)
@@ -552,3 +633,15 @@ impl HyperliquidHttpClient {
         })
     }
 }
+
+/// Wraps [`parse_addr_list`] from `http::client`, mapping the `String` error to a `PyErr`.
+///
+/// Returns an empty Vec if the input is `None` or all entries are empty/whitespace.
+/// Returns a [`PyErr`] if any non-empty entry fails to parse as an [`IpAddr`].
+fn resolve_addr_list(
+    field_name: &str,
+    raw: &Option<Vec<String>>,
+) -> PyResult<Vec<std::net::IpAddr>> {
+    parse_addr_list(field_name, raw).map_err(to_pyvalue_err)
+}
+

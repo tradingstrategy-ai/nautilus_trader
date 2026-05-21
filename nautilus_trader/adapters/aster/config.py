@@ -106,6 +106,12 @@ class AsterDataClientConfig(LiveDataClientConfig, frozen=True):
     use_agg_trade_ticks : bool, default False
         Whether to use aggregated trade tick endpoints instead of raw trades.
         TradeId of ticks will be the Aggregate tradeId returned by Aster.
+    local_addr : str, optional
+        Optional local source IP address to bind outbound TCP connections to (REST + WS).
+        When set, every outbound socket from this client originates from the given local
+        IP — used to pin a single bot process to a specific source IP. Must be a valid
+        IPv4 or IPv6 literal (e.g. ``"51.89.47.201"``). When ``None`` (default), the
+        kernel selects the source IP from the routing table.
 
     """
 
@@ -122,6 +128,7 @@ class AsterDataClientConfig(LiveDataClientConfig, frozen=True):
     testnet: bool = False
     update_instruments_interval_mins: PositiveInt | None = 60
     use_agg_trade_ticks: bool = False
+    local_addr: str | None = None
 
 
 class AsterExecClientConfig(LiveExecClientConfig, frozen=True):
@@ -220,3 +227,4 @@ class AsterExecClientConfig(LiveExecClientConfig, frozen=True):
     futures_leverages: dict[AsterSymbol, PositiveInt] | None = None
     futures_margin_types: dict[AsterSymbol, AsterFuturesMarginType] | None = None
     log_rejected_due_post_only_as_warning: bool = True
+    local_addr: str | None = None

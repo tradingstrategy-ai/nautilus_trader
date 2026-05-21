@@ -121,6 +121,37 @@ impl AsterRawFuturesHttpClient {
         timeout_secs: Option<u64>,
         proxy_url: Option<String>,
     ) -> AsterFuturesHttpResult<Self> {
+        Self::new_with_local_addr(
+            product_type,
+            environment,
+            api_key,
+            api_secret,
+            base_url_override,
+            recv_window,
+            timeout_secs,
+            proxy_url,
+            None,
+        )
+    }
+
+    /// Creates a new [`AsterRawFuturesHttpClient`] with an optional `local_addr` for
+    /// source-IP pinning. See [`HttpClient::new_with_local_addr`] for semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if credentials are incomplete or the HTTP client fails to build.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_local_addr(
+        product_type: AsterProductType,
+        environment: AsterEnvironment,
+        api_key: Option<String>,
+        api_secret: Option<String>,
+        base_url_override: Option<String>,
+        recv_window: Option<u64>,
+        timeout_secs: Option<u64>,
+        proxy_url: Option<String>,
+        local_addr: Option<std::net::IpAddr>,
+    ) -> AsterFuturesHttpResult<Self> {
         let RateLimitConfig {
             default_quota,
             keyed_quotas,
@@ -139,13 +170,14 @@ impl AsterRawFuturesHttpClient {
         let api_path = Self::resolve_api_path(product_type);
         let headers = Self::default_headers(&credential);
 
-        let client = HttpClient::new(
+        let client = HttpClient::new_with_local_addr(
             headers,
             vec![ASTER_API_KEY_HEADER.to_string()],
             keyed_quotas,
             default_quota,
             timeout_secs,
             proxy_url,
+            local_addr,
         )?;
 
         Ok(Self {
@@ -1126,6 +1158,41 @@ impl AsterFuturesHttpClient {
         proxy_url: Option<String>,
         treat_expired_as_canceled: bool,
     ) -> AsterFuturesHttpResult<Self> {
+        Self::new_with_local_addr(
+            product_type,
+            environment,
+            clock,
+            api_key,
+            api_secret,
+            base_url_override,
+            recv_window,
+            timeout_secs,
+            proxy_url,
+            treat_expired_as_canceled,
+            None,
+        )
+    }
+
+    /// Like [`new`](Self::new) but accepts an optional `local_addr` to pin outbound
+    /// TCP connections to a specific source IP.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the product type is invalid or HTTP client creation fails.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_local_addr(
+        product_type: AsterProductType,
+        environment: AsterEnvironment,
+        clock: &'static AtomicTime,
+        api_key: Option<String>,
+        api_secret: Option<String>,
+        base_url_override: Option<String>,
+        recv_window: Option<u64>,
+        timeout_secs: Option<u64>,
+        proxy_url: Option<String>,
+        treat_expired_as_canceled: bool,
+        local_addr: Option<std::net::IpAddr>,
+    ) -> AsterFuturesHttpResult<Self> {
         match product_type {
             AsterProductType::UsdM | AsterProductType::CoinM => {}
             _ => {
@@ -1135,7 +1202,7 @@ impl AsterFuturesHttpClient {
             }
         }
 
-        let raw = AsterRawFuturesHttpClient::new(
+        let raw = AsterRawFuturesHttpClient::new_with_local_addr(
             product_type,
             environment,
             api_key,
@@ -1144,6 +1211,7 @@ impl AsterFuturesHttpClient {
             recv_window,
             timeout_secs,
             proxy_url,
+            local_addr,
         )?;
 
         Ok(Self {
@@ -2488,5 +2556,53 @@ mod tests {
             }
             other => panic!("Expected AsterError, was {other:?}"),
         }
+    }
+
+    // ---------- local_addr plumbing ----------
+
+    #[rstest]
+    fn test_aster_raw_http_client_local_addr_none_equivalent_to_new() {
+        let a = AsterRawFuturesHttpClient::new(
+            AsterProductType::UsdM,
+            AsterEnvironment::Mainnet,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let b = AsterRawFuturesHttpClient::new_with_local_addr(
+            AsterProductType::UsdM,
+            AsterEnvironment::Mainnet,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(a.is_ok());
+        assert!(b.is_ok());
+    }
+
+    #[rstest]
+    fn test_aster_raw_http_client_local_addr_loopback_builds() {
+        let result = AsterRawFuturesHttpClient::new_with_local_addr(
+            AsterProductType::UsdM,
+            AsterEnvironment::Mainnet,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        );
+        assert!(
+            result.is_ok(),
+            "expected client to build with local_addr=127.0.0.1, was {result:?}"
+        );
     }
 }

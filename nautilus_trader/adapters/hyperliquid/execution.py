@@ -141,6 +141,7 @@ class HyperliquidExecutionClient(LiveExecutionClient):
             url=config.base_url_ws,
             testnet=config.testnet,
             account_id=str(account_id),
+            local_addr=config.local_addr,
         )
 
         # Caches to handle race conditions and duplicate messages

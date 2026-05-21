@@ -33,6 +33,7 @@ impl AsterDataClientConfig {
     ///
     /// Ed25519 API keys are required for SBE WebSocket streams.
     #[new]
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
         product_types = None,
         environment = None,
@@ -41,6 +42,7 @@ impl AsterDataClientConfig {
         api_key = None,
         api_secret = None,
         instrument_status_poll_secs = None,
+        local_addr = None,
     ))]
     fn py_new(
         product_types: Option<Vec<AsterProductType>>,
@@ -50,9 +52,19 @@ impl AsterDataClientConfig {
         api_key: Option<String>,
         api_secret: Option<String>,
         instrument_status_poll_secs: Option<u64>,
-    ) -> Self {
+        local_addr: Option<String>,
+    ) -> PyResult<Self> {
+        use std::str::FromStr;
         let defaults = Self::default();
-        Self {
+        let local_addr_parsed = match local_addr {
+            Some(addr_str) => Some(std::net::IpAddr::from_str(&addr_str).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "Invalid local_addr '{addr_str}': {e}"
+                ))
+            })?),
+            None => defaults.local_addr,
+        };
+        Ok(Self {
             product_types: product_types.unwrap_or(defaults.product_types),
             environment: environment.unwrap_or(defaults.environment),
             base_url_http: base_url_http.or(defaults.base_url_http),
@@ -61,7 +73,8 @@ impl AsterDataClientConfig {
             api_secret: api_secret.or(defaults.api_secret),
             instrument_status_poll_secs: instrument_status_poll_secs
                 .unwrap_or(defaults.instrument_status_poll_secs),
-        }
+            local_addr: local_addr_parsed,
+        })
     }
 
     fn __repr__(&self) -> String {
@@ -94,6 +107,7 @@ impl AsterExecClientConfig {
         futures_leverages = None,
         futures_margin_types = None,
         treat_expired_as_canceled = false,
+        local_addr = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn py_new(
@@ -112,9 +126,19 @@ impl AsterExecClientConfig {
         futures_leverages: Option<HashMap<String, u32>>,
         futures_margin_types: Option<HashMap<String, AsterMarginType>>,
         treat_expired_as_canceled: bool,
-    ) -> Self {
+        local_addr: Option<String>,
+    ) -> PyResult<Self> {
+        use std::str::FromStr;
         let defaults = Self::default();
-        Self {
+        let local_addr_parsed = match local_addr {
+            Some(addr_str) => Some(std::net::IpAddr::from_str(&addr_str).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "Invalid local_addr '{addr_str}': {e}"
+                ))
+            })?),
+            None => defaults.local_addr,
+        };
+        Ok(Self {
             trader_id,
             account_id,
             product_types: product_types.unwrap_or(defaults.product_types),
@@ -132,7 +156,8 @@ impl AsterExecClientConfig {
             futures_leverages,
             futures_margin_types,
             treat_expired_as_canceled,
-        }
+            local_addr: local_addr_parsed,
+        })
     }
 
     fn __repr__(&self) -> String {
@@ -149,7 +174,8 @@ mod tests {
 
     #[rstest]
     fn test_data_client_py_new_uses_defaults_for_omitted_fields() {
-        let config = AsterDataClientConfig::py_new(None, None, None, None, None, None, None);
+        let config =
+            AsterDataClientConfig::py_new(None, None, None, None, None, None, None, None).unwrap();
         let defaults = AsterDataClientConfig::default();
 
         assert_eq!(config.product_types, defaults.product_types);
@@ -174,7 +200,9 @@ mod tests {
             Some("api-key".to_string()),
             Some("api-secret".to_string()),
             Some(15),
-        );
+            None,
+        )
+        .unwrap();
 
         assert_eq!(config.product_types, vec![AsterProductType::UsdM]);
         assert_eq!(config.environment, AsterEnvironment::Testnet);
@@ -194,8 +222,9 @@ mod tests {
         let account_id = AccountId::from("ASTER-001");
         let config = AsterExecClientConfig::py_new(
             trader_id, account_id, None, None, None, None, None, true, true, None, None, None,
-            None, None, false,
-        );
+            None, None, false, None,
+        )
+        .unwrap();
         let defaults = AsterExecClientConfig::default();
 
         assert_eq!(config.trader_id, trader_id);
@@ -241,7 +270,9 @@ mod tests {
             Some(leverages.clone()),
             Some(margin_types.clone()),
             true,
-        );
+            None,
+        )
+        .unwrap();
 
         assert_eq!(config.product_types, vec![AsterProductType::UsdM]);
         assert_eq!(config.environment, AsterEnvironment::Demo);
@@ -283,7 +314,9 @@ mod tests {
             None,
             None,
             false,
-        );
+            None,
+        )
+        .unwrap();
 
         assert_eq!(config.default_taker_fee, defaults.default_taker_fee);
     }
