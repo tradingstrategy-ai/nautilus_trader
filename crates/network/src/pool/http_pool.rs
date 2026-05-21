@@ -81,6 +81,22 @@ impl HttpPool {
         self.slots.is_empty()
     }
 
+    /// Pick a slot and return a reference to the underlying [`HttpClient`].
+    ///
+    /// The `hint` parameter is accepted for API symmetry with `dispatch_async`
+    /// but `HttpPool` always round-robins stateless REST requests regardless
+    /// of hint.
+    ///
+    /// This method is preferred over `dispatch_async` at call sites that need
+    /// to `.await` the client directly (avoids async-closure lifetime issues).
+    pub fn pick_client(&self, _hint: PickHint<'_>) -> (usize, &HttpClient) {
+        if self.slots.len() == 1 {
+            return (0, &self.slots[0]);
+        }
+        let slot = self.rr_counter.fetch_add(1, Ordering::Relaxed) % self.slots.len();
+        (slot, &self.slots[slot])
+    }
+
     /// Round-robin dispatch. Returns `(slot_index, closure_result)`.
     ///
     /// # Safety-critical non-feature: no automatic retry on a different slot

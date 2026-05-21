@@ -49,7 +49,8 @@ use nautilus_model::{
     types::{AccountBalance, Currency, Money, Price, Quantity},
 };
 use nautilus_network::{
-    http::{HttpClient, HttpClientError, HttpResponse, Method, USER_AGENT},
+    http::{HttpClientError, HttpResponse, Method, USER_AGENT},
+    pool::{HttpClientTemplate, HttpPool, PickHint},
     ratelimiter::quota::Quota,
 };
 use rust_decimal::Decimal;
@@ -122,7 +123,7 @@ pub static HYPERLIQUID_REST_QUOTA: LazyLock<Quota> =
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.hyperliquid")
 )]
 pub struct HyperliquidRawHttpClient {
-    client: HttpClient,
+    pool: Arc<HttpPool>,
     is_testnet: bool,
     base_info: String,
     base_exchange: String,
@@ -136,6 +137,33 @@ pub struct HyperliquidRawHttpClient {
 }
 
 impl HyperliquidRawHttpClient {
+    /// Build an `HttpClientTemplate` carrying HL-specific headers + REST quota.
+    fn make_template(timeout_secs: u64, proxy_url: Option<String>) -> HttpClientTemplate {
+        HttpClientTemplate {
+            headers: Self::default_headers(),
+            header_keys: vec![],
+            keyed_quotas: vec![],
+            default_quota: Some(*HYPERLIQUID_REST_QUOTA),
+            timeout_secs: Some(timeout_secs),
+            proxy_url,
+        }
+    }
+
+    /// Build a pool for a single optional IP (`None` → kernel default / no bind).
+    fn make_pool_single(
+        timeout_secs: u64,
+        proxy_url: Option<String>,
+        local_addr: Option<std::net::IpAddr>,
+    ) -> std::result::Result<Arc<HttpPool>, HttpClientError> {
+        let template = Self::make_template(timeout_secs, proxy_url);
+        let pool = match local_addr {
+            Some(addr) => HttpPool::new(&template, vec![addr]),
+            None => HttpPool::new_no_bind(template),
+        }
+        .map_err(|e| HttpClientError::Error(e.to_string()))?;
+        Ok(Arc::new(pool))
+    }
+
     /// Creates a new [`HyperliquidRawHttpClient`] for public endpoints only.
     ///
     /// # Errors
@@ -161,16 +189,38 @@ impl HyperliquidRawHttpClient {
         proxy_url: Option<String>,
         local_addr: Option<std::net::IpAddr>,
     ) -> std::result::Result<Self, HttpClientError> {
+        let pool = Self::make_pool_single(timeout_secs, proxy_url, local_addr)?;
         Ok(Self {
-            client: HttpClient::new_with_local_addr(
-                Self::default_headers(),
-                vec![],
-                vec![],
-                Some(*HYPERLIQUID_REST_QUOTA),
-                Some(timeout_secs),
-                proxy_url,
-                local_addr,
-            )?,
+            pool,
+            is_testnet,
+            base_info: info_url(is_testnet).to_string(),
+            base_exchange: exchange_url(is_testnet).to_string(),
+            signer: None,
+            nonce_manager: None,
+            vault_address: None,
+            rest_limiter: Arc::new(WeightedLimiter::per_minute(1200)),
+            rate_limit_backoff_base: Duration::from_millis(125),
+            rate_limit_backoff_cap: Duration::from_secs(5),
+            rate_limit_max_attempts_info: 3,
+        })
+    }
+
+    /// Construct with a multi-IP REST pool. Round-robins requests across IPs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `addresses` is empty or if any `HttpClient` construction fails.
+    pub fn new_with_pool(
+        is_testnet: bool,
+        timeout_secs: u64,
+        proxy_url: Option<String>,
+        addresses: Vec<std::net::IpAddr>,
+    ) -> std::result::Result<Self, HttpClientError> {
+        let template = Self::make_template(timeout_secs, proxy_url);
+        let pool = HttpPool::new(&template, addresses)
+            .map_err(|e| HttpClientError::Error(e.to_string()))?;
+        Ok(Self {
+            pool: Arc::new(pool),
             is_testnet,
             base_info: info_url(is_testnet).to_string(),
             base_exchange: exchange_url(is_testnet).to_string(),
@@ -212,17 +262,9 @@ impl HyperliquidRawHttpClient {
     ) -> std::result::Result<Self, HttpClientError> {
         let signer = HyperliquidEip712Signer::new(secrets.private_key.clone());
         let nonce_manager = Arc::new(NonceManager::new());
-
+        let pool = Self::make_pool_single(timeout_secs, proxy_url, local_addr)?;
         Ok(Self {
-            client: HttpClient::new_with_local_addr(
-                Self::default_headers(),
-                vec![],
-                vec![],
-                Some(*HYPERLIQUID_REST_QUOTA),
-                Some(timeout_secs),
-                proxy_url,
-                local_addr,
-            )?,
+            pool,
             is_testnet: secrets.is_testnet,
             base_info: info_url(secrets.is_testnet).to_string(),
             base_exchange: exchange_url(secrets.is_testnet).to_string(),
@@ -554,22 +596,15 @@ impl HyperliquidRawHttpClient {
     }
 
     async fn http_roundtrip_info(&self, request: &InfoRequest) -> Result<HttpResponse> {
-        let url = &self.base_info;
+        let url = self.base_info.clone();
         let body = serde_json::to_value(request).map_err(Error::Serde)?;
         let body_bytes = serde_json::to_string(&body)
             .map_err(Error::Serde)?
             .into_bytes();
 
-        self.client
-            .request(
-                Method::POST,
-                url.clone(),
-                None,
-                None,
-                Some(body_bytes),
-                None,
-                None,
-            )
+        let (_slot, client) = self.pool.pick_client(PickHint::Stateless);
+        client
+            .request(Method::POST, url, None, None, Some(body_bytes), None, None)
             .await
             .map_err(Error::from_http_client)
     }
@@ -783,25 +818,15 @@ impl HyperliquidRawHttpClient {
     where
         T: serde::Serialize,
     {
-        let url = &self.base_exchange;
+        let url = self.base_exchange.clone();
         let body = serde_json::to_string(&request).map_err(Error::Serde)?;
         let body_bytes = body.into_bytes();
 
-        let response = self
-            .client
-            .request(
-                Method::POST,
-                url.clone(),
-                None,
-                None,
-                Some(body_bytes),
-                None,
-                None,
-            )
+        let (_slot, client) = self.pool.pick_client(PickHint::Stateless);
+        client
+            .request(Method::POST, url, None, None, Some(body_bytes), None, None)
             .await
-            .map_err(Error::from_http_client)?;
-
-        Ok(response)
+            .map_err(Error::from_http_client)
     }
 }
 
@@ -2970,5 +2995,29 @@ mod tests {
             result.is_ok(),
             "client construction shouldn't fail at build time even for unbindable IP, was {result:?}"
         );
+    }
+
+    // ---------- HttpPool-backed constructor tests ----------
+
+    #[test]
+    fn raw_http_client_new_with_pool_loopback() {
+        use super::HyperliquidRawHttpClient;
+        let result = HyperliquidRawHttpClient::new_with_pool(
+            true,
+            60,
+            None,
+            vec![
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+            ],
+        );
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn raw_http_client_new_with_pool_empty_errors() {
+        use super::HyperliquidRawHttpClient;
+        let result = HyperliquidRawHttpClient::new_with_pool(true, 60, None, vec![]);
+        assert!(result.is_err());
     }
 }
