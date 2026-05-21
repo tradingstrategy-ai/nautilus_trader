@@ -104,6 +104,13 @@ impl HttpPool {
             matches!(hint, PickHint::Stateless),
             "HttpPool got non-Stateless hint"
         );
+        // Fast path: singleton pool (e.g. `HyperliquidRawHttpClient::new()` via
+        // `new_no_bind`, or any operator who set `HL_LOCAL_ADDR=<single-ip>`)
+        // skips the atomic. Preserves PR #4's overhead profile exactly for
+        // single-IP users.
+        if self.slots.len() == 1 {
+            return (0, f(&self.slots[0]).await);
+        }
         let slot = self.rr_counter.fetch_add(1, Ordering::Relaxed) % self.slots.len();
         let result = f(&self.slots[slot]).await;
         (slot, result)
