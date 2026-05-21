@@ -6,6 +6,9 @@
 pub mod http_pool;
 pub use http_pool::HttpPool;
 
+pub mod ws_pool;
+pub use ws_pool::{WsConnectArgs, WsPool};
+
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
