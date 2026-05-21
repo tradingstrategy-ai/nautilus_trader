@@ -41,4 +41,22 @@ mod tests {
         let b = slot_for_instrument("BTC", 3);
         assert_eq!(a, b);
     }
+
+    #[test]
+    fn slot_for_instrument_known_values() {
+        // Hardcoded so a future hash-function change fails this test loudly.
+        // If you genuinely need to change the hash, update these AND bump
+        // a major version since all operators' instrument-to-IP mapping shifts.
+        // Values discovered on first run; fill in after Step 2.
+        assert_eq!(slot_for_instrument("BTC", 3), 2);
+        assert_eq!(slot_for_instrument("ETH", 3), 1);
+        assert_eq!(slot_for_instrument("SOL", 3), 0);
+        assert_eq!(slot_for_instrument("BTC", 1), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "n_slots=0")]
+    fn slot_for_instrument_panics_on_zero_slots() {
+        slot_for_instrument("BTC", 0);
+    }
 }
