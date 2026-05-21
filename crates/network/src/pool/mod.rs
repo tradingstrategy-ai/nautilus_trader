@@ -3,6 +3,9 @@
 //! See `docs/superpowers/specs/2026-05-21-multi-ip-rest-ws-pool-design.md`
 //! in the nautilus-strategies repo for the design rationale.
 
+pub mod http_pool;
+pub use http_pool::HttpPool;
+
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
