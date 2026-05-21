@@ -48,6 +48,9 @@ def get_cached_hyperliquid_http_client(
     proxy_url: str | None = None,
     normalize_prices: bool = True,
     local_addr: str | None = None,
+    local_addrs_rest: tuple[str, ...] | None = None,
+    local_addrs_ws: tuple[str, ...] | None = None,
+    ws_shard_by: str | None = None,
 ) -> nautilus_pyo3.HyperliquidHttpClient:
     """
     Cache and return a Hyperliquid HTTP client with the given parameters.
@@ -77,6 +80,17 @@ def get_cached_hyperliquid_http_client(
         Optional HTTP proxy URL.
     normalize_prices : bool, default True
         If order prices should be normalized to 5 significant figures.
+    local_addr : str, optional
+        Optional local source IP address to bind outbound TCP connections to.
+    local_addrs_rest : tuple[str, ...], optional
+        Multi-IP REST pool. Passed as a tuple for ``lru_cache`` hashability;
+        converted to a list when forwarded to the pyo3 client.
+        Overrides ``local_addr`` when non-empty.
+    local_addrs_ws : tuple[str, ...], optional
+        Reserved for future use (WS multi-IP pooling). Passed as a tuple for
+        ``lru_cache`` hashability.
+    ws_shard_by : str, optional
+        Reserved for future use alongside ``local_addrs_ws``.
 
     Returns
     -------
@@ -92,6 +106,9 @@ def get_cached_hyperliquid_http_client(
         "proxy_url": proxy_url,
         "normalize_prices": normalize_prices,
         "local_addr": local_addr,
+        "local_addrs_rest": list(local_addrs_rest) if local_addrs_rest else None,
+        "local_addrs_ws": list(local_addrs_ws) if local_addrs_ws else None,
+        "ws_shard_by": ws_shard_by,
     }
 
     if timeout_secs is not None:
@@ -183,6 +200,9 @@ class HyperliquidLiveDataClientFactory(LiveDataClientFactory):
             testnet=config.testnet,
             proxy_url=config.http_proxy_url,
             local_addr=config.local_addr,
+            local_addrs_rest=tuple(config.local_addrs_rest) if config.local_addrs_rest else None,
+            local_addrs_ws=tuple(config.local_addrs_ws) if config.local_addrs_ws else None,
+            ws_shard_by=config.ws_shard_by,
         )
         provider = get_cached_hyperliquid_instrument_provider(
             client=client,
@@ -247,6 +267,9 @@ class HyperliquidLiveExecClientFactory(LiveExecClientFactory):
             proxy_url=config.http_proxy_url,
             normalize_prices=config.normalize_prices,
             local_addr=config.local_addr,
+            local_addrs_rest=tuple(config.local_addrs_rest) if config.local_addrs_rest else None,
+            local_addrs_ws=tuple(config.local_addrs_ws) if config.local_addrs_ws else None,
+            ws_shard_by=config.ws_shard_by,
         )
         provider = get_cached_hyperliquid_instrument_provider(
             client=client,

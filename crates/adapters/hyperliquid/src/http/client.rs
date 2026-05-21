@@ -342,6 +342,73 @@ impl HyperliquidRawHttpClient {
             .map_err(|e| Error::auth(format!("Failed to create HTTP client: {e}")))
     }
 
+    /// Like [`from_credentials_with_local_addr`](Self::from_credentials_with_local_addr)
+    /// but builds a multi-IP REST pool. Round-robins requests across `addresses`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Auth`] if the private key is invalid or the HTTP client
+    /// pool cannot be constructed.
+    pub fn from_credentials_with_pool(
+        private_key: &str,
+        vault_address: Option<&str>,
+        is_testnet: bool,
+        timeout_secs: u64,
+        proxy_url: Option<String>,
+        addresses: Vec<std::net::IpAddr>,
+    ) -> Result<Self> {
+        let secrets = Secrets::from_private_key(private_key, vault_address, is_testnet)
+            .map_err(|e| Error::auth(format!("invalid credentials: {e}")))?;
+        Self::with_credentials_and_pool(&secrets, timeout_secs, proxy_url, addresses)
+            .map_err(|e| Error::auth(format!("Failed to create HTTP client: {e}")))
+    }
+
+    /// Like [`with_credentials_and_local_addr`](Self::with_credentials_and_local_addr)
+    /// but builds a multi-IP REST pool. Round-robins requests across `addresses`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP client pool cannot be constructed.
+    pub fn with_credentials_and_pool(
+        secrets: &Secrets,
+        timeout_secs: u64,
+        proxy_url: Option<String>,
+        addresses: Vec<std::net::IpAddr>,
+    ) -> std::result::Result<Self, HttpClientError> {
+        let signer = HyperliquidEip712Signer::new(secrets.private_key.clone());
+        let nonce_manager = Arc::new(NonceManager::new());
+        let pool = Self::make_pool_multi(timeout_secs, proxy_url, addresses)?;
+        Ok(Self {
+            pool,
+            is_testnet: secrets.is_testnet,
+            base_info: info_url(secrets.is_testnet).to_string(),
+            base_exchange: exchange_url(secrets.is_testnet).to_string(),
+            signer: Some(signer),
+            nonce_manager: Some(nonce_manager),
+            vault_address: secrets.vault_address,
+            rest_limiter: Arc::new(WeightedLimiter::per_minute(1200)),
+            rate_limit_backoff_base: Duration::from_millis(125),
+            rate_limit_backoff_cap: Duration::from_secs(5),
+            rate_limit_max_attempts_info: 3,
+        })
+    }
+
+    /// Internal: build a multi-slot pool from a non-empty IP list.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `addresses` is empty or if any `HttpClient` construction fails.
+    fn make_pool_multi(
+        timeout_secs: u64,
+        proxy_url: Option<String>,
+        addresses: Vec<std::net::IpAddr>,
+    ) -> std::result::Result<Arc<HttpPool>, HttpClientError> {
+        let template = Self::make_template(timeout_secs, proxy_url);
+        let pool = HttpPool::new(&template, addresses)
+            .map_err(|e| HttpClientError::Error(e.to_string()))?;
+        Ok(Arc::new(pool))
+    }
+
     /// Configure rate limiting parameters (chainable).
     #[must_use]
     pub fn with_rate_limits(mut self) -> Self {
@@ -1098,6 +1165,78 @@ impl HyperliquidHttpClient {
                 // No credentials available, create unauthenticated client
                 Self::new_with_local_addr(is_testnet, timeout_secs, proxy_url, local_addr)
                     .map_err(|e| Error::auth(format!("Failed to create HTTP client: {e}")))
+            }
+        }
+    }
+
+    /// Like [`with_credentials_and_local_addr`](Self::with_credentials_and_local_addr)
+    /// but uses a multi-IP REST pool. Round-robins requests across `addresses`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Auth`] if credentials are invalid or the pool can't be constructed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_credentials_and_pool(
+        private_key: Option<String>,
+        vault_address: Option<String>,
+        account_address: Option<String>,
+        is_testnet: bool,
+        timeout_secs: u64,
+        proxy_url: Option<String>,
+        addresses: Vec<std::net::IpAddr>,
+    ) -> Result<Self> {
+        let pk_env_var = if is_testnet {
+            "HYPERLIQUID_TESTNET_PK"
+        } else {
+            "HYPERLIQUID_PK"
+        };
+        let vault_env_var = if is_testnet {
+            "HYPERLIQUID_TESTNET_VAULT"
+        } else {
+            "HYPERLIQUID_VAULT"
+        };
+
+        let resolved_pk = match private_key {
+            Some(pk) => Some(pk),
+            None => env::var(pk_env_var).ok(),
+        };
+        let resolved_vault = match vault_address {
+            Some(vault) => Some(vault),
+            None => env::var(vault_env_var).ok(),
+        };
+        let resolved_account_address = match account_address {
+            Some(addr) => Some(addr),
+            None => env::var("HYPERLIQUID_ACCOUNT_ADDRESS").ok(),
+        };
+
+        match resolved_pk {
+            Some(pk) => {
+                let raw_client = HyperliquidRawHttpClient::from_credentials_with_pool(
+                    &pk,
+                    resolved_vault.as_deref(),
+                    is_testnet,
+                    timeout_secs,
+                    proxy_url,
+                    addresses,
+                )?;
+                Ok(Self {
+                    inner: Arc::new(raw_client),
+                    clock: get_atomic_clock_realtime(),
+                    instruments: Arc::new(AtomicMap::new()),
+                    instruments_by_coin: Arc::new(AtomicMap::new()),
+                    asset_indices: Arc::new(AtomicMap::new()),
+                    spot_fill_coins: Arc::new(AtomicMap::new()),
+                    account_id: None,
+                    account_address: resolved_account_address,
+                    normalize_prices: true,
+                })
+            }
+            None => {
+                // No credentials — unauthenticated client via Raw new_with_pool.
+                let raw_client =
+                    HyperliquidRawHttpClient::new_with_pool(is_testnet, timeout_secs, proxy_url, addresses)
+                        .map_err(|e| Error::auth(format!("Failed to create HTTP client: {e}")))?;
+                Ok(Self::from_raw(raw_client))
             }
         }
     }
@@ -3019,5 +3158,88 @@ mod tests {
         use super::HyperliquidRawHttpClient;
         let result = HyperliquidRawHttpClient::new_with_pool(true, 60, None, vec![]);
         assert!(result.is_err());
+    }
+}
+
+/// Parse a list of IP strings into `Vec<IpAddr>`, returning `Err(String)` on failure.
+///
+/// Pure-Rust helper (no pyo3 dependency) that can be unit-tested without the
+/// `python` feature. The pyo3 wrapper in `python/http.rs` calls this and maps
+/// the `String` error into a `PyErr`.
+///
+/// Empty strings and whitespace-only entries are silently skipped.
+///
+/// # Errors
+///
+/// Returns a `String` error message if any non-empty entry cannot be parsed as
+/// an [`IpAddr`].
+pub(crate) fn parse_addr_list(
+    field_name: &str,
+    raw: &Option<Vec<String>>,
+) -> std::result::Result<Vec<std::net::IpAddr>, String> {
+    let Some(list) = raw else {
+        return Ok(Vec::new());
+    };
+    list.iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<std::net::IpAddr>()
+                .map_err(|e| format!("Invalid {field_name} entry '{s}': {e}"))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod addr_list_tests {
+    use super::parse_addr_list;
+
+    #[test]
+    fn parse_addr_list_none_returns_empty() {
+        assert!(parse_addr_list("test", &None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_addr_list_empty_strings_filtered() {
+        let input = Some(vec!["".to_string(), "  ".to_string()]);
+        assert!(parse_addr_list("test", &input).unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_addr_list_parses_valid_ips() {
+        let input = Some(vec!["127.0.0.1".to_string(), "10.0.0.1".to_string()]);
+        let result = parse_addr_list("test", &input).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].to_string(), "127.0.0.1");
+        assert_eq!(result[1].to_string(), "10.0.0.1");
+    }
+
+    #[test]
+    fn parse_addr_list_trims_whitespace() {
+        let input = Some(vec![" 127.0.0.1 ".to_string()]);
+        let result = parse_addr_list("test", &input).unwrap();
+        assert_eq!(result[0].to_string(), "127.0.0.1");
+    }
+
+    #[test]
+    fn parse_addr_list_rejects_garbage() {
+        let input = Some(vec!["not.an.ip".to_string()]);
+        let err = parse_addr_list("test", &input).unwrap_err();
+        assert!(
+            err.contains("Invalid test entry 'not.an.ip'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_addr_list_drops_empties_keeps_valid() {
+        let input = Some(vec![
+            "".to_string(),
+            "127.0.0.1".to_string(),
+            "  ".to_string(),
+        ]);
+        let result = parse_addr_list("test", &input).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].to_string(), "127.0.0.1");
     }
 }

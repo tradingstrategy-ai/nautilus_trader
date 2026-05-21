@@ -49,6 +49,19 @@ class HyperliquidDataClientConfig(LiveDataClientConfig, frozen=True):
         Hyperliquid rate-limits by source IP and the host has multiple IPs available.
         Must be a valid IPv4 or IPv6 literal (e.g. ``"51.89.47.201"`` or ``"2001:db8::1"``).
         When ``None`` (default), the kernel selects the source IP from the routing table.
+    local_addrs_rest : list[str], optional
+        Multi-IP REST pool. Round-robins outbound REST requests across the given source IPs
+        to spread rate-limit pressure across multiple addresses.
+        Each entry must be a valid IPv4 or IPv6 literal. Overrides ``local_addr`` (singular)
+        when set. Empty list / ``None`` falls back to ``local_addr``, then kernel default.
+    local_addrs_ws : list[str], optional
+        Reserved for future use. WS multi-IP pooling is tracked as a follow-up PR;
+        setting this today logs a warning but has no effect — the WS connection uses
+        ``local_addr`` (singular) or the kernel default.
+    ws_shard_by : str, optional
+        Reserved for future use alongside ``local_addrs_ws``. One of
+        ``"instrument"`` (default, hash by symbol) or ``"round_robin"``. No
+        effect until WS pooling lands.
 
     """
 
@@ -59,6 +72,9 @@ class HyperliquidDataClientConfig(LiveDataClientConfig, frozen=True):
     product_types: tuple[HyperliquidProductType, ...] | None = None
     http_timeout_secs: PositiveInt = 10
     local_addr: str | None = None
+    local_addrs_rest: list[str] | None = None
+    local_addrs_ws: list[str] | None = None
+    ws_shard_by: str | None = None
 
 
 class HyperliquidExecClientConfig(LiveExecClientConfig, frozen=True):
@@ -115,6 +131,19 @@ class HyperliquidExecClientConfig(LiveExecClientConfig, frozen=True):
         Hyperliquid rate-limits by source IP and the host has multiple IPs available.
         Must be a valid IPv4 or IPv6 literal (e.g. ``"51.89.47.201"`` or ``"2001:db8::1"``).
         When ``None`` (default), the kernel selects the source IP from the routing table.
+    local_addrs_rest : list[str], optional
+        Multi-IP REST pool. Round-robins outbound REST requests across the given source IPs
+        to spread rate-limit pressure across multiple addresses.
+        Each entry must be a valid IPv4 or IPv6 literal. Overrides ``local_addr`` (singular)
+        when set. Empty list / ``None`` falls back to ``local_addr``, then kernel default.
+    local_addrs_ws : list[str], optional
+        Reserved for future use. WS multi-IP pooling is tracked as a follow-up PR;
+        setting this today logs a warning but has no effect — the WS connection uses
+        ``local_addr`` (singular) or the kernel default.
+    ws_shard_by : str, optional
+        Reserved for future use alongside ``local_addrs_ws``. One of
+        ``"instrument"`` (default, hash by symbol) or ``"round_robin"``. No
+        effect until WS pooling lands.
 
     Warnings
     --------
@@ -136,3 +165,6 @@ class HyperliquidExecClientConfig(LiveExecClientConfig, frozen=True):
     http_timeout_secs: PositiveInt = 10
     normalize_prices: bool = True
     local_addr: str | None = None
+    local_addrs_rest: list[str] | None = None
+    local_addrs_ws: list[str] | None = None
+    ws_shard_by: str | None = None
