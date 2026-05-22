@@ -3338,6 +3338,42 @@ fn perp_dex_asset_index_base(dex_index: usize) -> u32 {
     }
 }
 
+/// Parse a list of IP strings into `Vec<IpAddr>`, returning `Err(String)` on failure.
+///
+/// Pure-Rust helper (no pyo3 dependency) that can be unit-tested without the
+/// `python` feature. The pyo3 wrapper in `python/http.rs` calls this and maps
+/// the `String` error into a `PyErr`.
+///
+/// Empty strings and whitespace-only entries are silently skipped.
+///
+/// # Errors
+///
+/// Returns a `String` error message if any non-empty entry cannot be parsed
+/// as an [`std::net::IpAddr`].
+#[cfg_attr(
+    not(feature = "python"),
+    allow(
+        dead_code,
+        reason = "only used by the pyo3 binding; unit tests exercise it directly"
+    )
+)]
+pub(crate) fn parse_addr_list(
+    field_name: &str,
+    raw: &Option<Vec<String>>,
+) -> std::result::Result<Vec<std::net::IpAddr>, String> {
+    let Some(list) = raw else {
+        return Ok(Vec::new());
+    };
+    list.iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<std::net::IpAddr>()
+                .map_err(|e| format!("Invalid {field_name} entry '{s}': {e}"))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::{net::SocketAddr, sync::Arc};
@@ -3848,7 +3884,7 @@ mod tests {
 
     #[rstest]
     fn parse_addr_list_empty_strings_filtered() {
-        let input = Some(vec!["".to_string(), "  ".to_string()]);
+        let input = Some(vec![String::new(), "  ".to_string()]);
         assert!(parse_addr_list("test", &input).unwrap().is_empty());
     }
 
@@ -3881,7 +3917,7 @@ mod tests {
     #[rstest]
     fn parse_addr_list_drops_empties_keeps_valid() {
         let input = Some(vec![
-            "".to_string(),
+            String::new(),
             "127.0.0.1".to_string(),
             "  ".to_string(),
         ]);
@@ -3918,33 +3954,4 @@ mod tests {
         );
         assert!(result.is_err(), "empty pool must fail to construct");
     }
-}
-
-/// Parse a list of IP strings into `Vec<IpAddr>`, returning `Err(String)` on failure.
-///
-/// Pure-Rust helper (no pyo3 dependency) that can be unit-tested without the
-/// `python` feature. The pyo3 wrapper in `python/http.rs` calls this and maps
-/// the `String` error into a `PyErr`.
-///
-/// Empty strings and whitespace-only entries are silently skipped.
-///
-/// # Errors
-///
-/// Returns a `String` error message if any non-empty entry cannot be parsed
-/// as an [`std::net::IpAddr`].
-pub(crate) fn parse_addr_list(
-    field_name: &str,
-    raw: &Option<Vec<String>>,
-) -> std::result::Result<Vec<std::net::IpAddr>, String> {
-    let Some(list) = raw else {
-        return Ok(Vec::new());
-    };
-    list.iter()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| {
-            s.parse::<std::net::IpAddr>()
-                .map_err(|e| format!("Invalid {field_name} entry '{s}': {e}"))
-        })
-        .collect()
 }
