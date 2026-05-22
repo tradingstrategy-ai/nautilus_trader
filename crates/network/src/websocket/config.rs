@@ -25,7 +25,7 @@
 //!
 //! Use `Some(n)` primarily for testing, development, or non-critical connections.
 
-use std::fmt::Debug;
+use std::{fmt::Debug, net::IpAddr};
 
 use serde::{Deserialize, Serialize};
 
@@ -152,10 +152,24 @@ pub struct WebSocketConfig {
     /// `http://` and `https://` schemes; SOCKS schemes are not yet supported.
     #[serde(default)]
     pub proxy_url: Option<String>,
+    /// Optional local source IP to bind outbound TCP connections to.
+    ///
+    /// When set, the WebSocket connection will originate from the given local
+    /// IP. This is used to pin a process to a specific source IP (e.g. for
+    /// venues that rate-limit by source IP). When `None`, the kernel selects
+    /// the default source IP from the routing table.
+    ///
+    /// Only honoured by the Tungstenite backend in production builds. The
+    /// Sockudo backend currently ignores this field; the Turmoil simulator
+    /// build accepts the field for API symmetry but does not enforce binding.
+    #[serde(default)]
+    pub local_addr: Option<IpAddr>,
 }
 
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
     use rstest::rstest;
     use serde_json::json;
 
@@ -171,5 +185,42 @@ mod tests {
         let error = serde_json::from_value::<WebSocketConfig>(config).unwrap_err();
 
         assert!(error.to_string().contains("unknown field `unexpected`"));
+    }
+
+    #[rstest]
+    fn test_local_addr_default_is_none() {
+        let cfg = WebSocketConfig::builder()
+            .url("wss://example.com/ws".to_string())
+            .build();
+        assert!(cfg.local_addr.is_none());
+    }
+
+    #[rstest]
+    fn test_local_addr_builder_v4() {
+        let cfg = WebSocketConfig::builder()
+            .url("wss://example.com/ws".to_string())
+            .local_addr(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .build();
+        assert_eq!(cfg.local_addr, Some(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+    }
+
+    #[rstest]
+    fn test_local_addr_builder_v6() {
+        let cfg = WebSocketConfig::builder()
+            .url("wss://example.com/ws".to_string())
+            .local_addr(IpAddr::V6(Ipv6Addr::LOCALHOST))
+            .build();
+        assert_eq!(cfg.local_addr, Some(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+    }
+
+    #[rstest]
+    fn test_local_addr_round_trip_serde() {
+        let cfg = WebSocketConfig::builder()
+            .url("wss://example.com/ws".to_string())
+            .local_addr(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)))
+            .build();
+        let serialized = serde_json::to_string(&cfg).unwrap();
+        let restored: WebSocketConfig = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(restored.local_addr, cfg.local_addr);
     }
 }

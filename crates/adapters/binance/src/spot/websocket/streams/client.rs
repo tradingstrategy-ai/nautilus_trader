@@ -441,6 +441,7 @@ impl BinanceSpotWebSocketClient {
             idle_timeout_ms: None,
             backend: self.transport_backend,
             proxy_url: None,
+            local_addr: None,
         };
 
         let keyed_quotas = vec![(

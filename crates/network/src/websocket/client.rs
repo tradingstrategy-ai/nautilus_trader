@@ -256,6 +256,7 @@ impl WebSocketClientInner {
             config.headers.clone(),
             config.backend,
             config.proxy_url.as_deref(),
+            config.local_addr,
         ))
         .await?;
 
@@ -360,6 +361,7 @@ impl WebSocketClientInner {
         headers: Vec<(String, String)>,
         backend: TransportBackend,
         proxy_url: Option<&str>,
+        local_addr: Option<std::net::IpAddr>,
     ) -> Result<(MessageWriter, MessageReader), TransportError> {
         // Sockudo does not yet support proxy tunnels. When a proxy URL is supplied,
         // route through Tungstenite so configurations that rely on the runtime
@@ -375,11 +377,22 @@ impl WebSocketClientInner {
         match backend {
             TransportBackend::Tungstenite => match proxy_url {
                 Some(proxy) => {
+                    if local_addr.is_some() {
+                        log::warn!(
+                            "WebSocket local_addr is ignored when proxy_url is set; \
+                             the proxy hop will use the kernel default source IP"
+                        );
+                    }
                     Box::pin(Self::connect_tungstenite_via_proxy(url, headers, proxy)).await
                 }
-                None => Self::connect_tungstenite(url, headers).await,
+                None => Self::connect_tungstenite(url, headers, local_addr).await,
             },
             TransportBackend::Sockudo => {
+                if local_addr.is_some() {
+                    log::warn!(
+                        "Sockudo backend does not honour local_addr; the connection will use the kernel default source IP"
+                    );
+                }
                 #[cfg(feature = "transport-sockudo")]
                 {
                     Self::connect_sockudo(url, headers).await
@@ -398,11 +411,16 @@ impl WebSocketClientInner {
 
     /// Connects with the server creating a tokio-tungstenite websocket stream.
     /// Production version that uses `connect_async_with_config` convenience helper.
+    ///
+    /// When `local_addr` is `Some(ip)`, the convenience helper is bypassed in
+    /// favour of a manual `TcpSocket::bind` + `client_async_tls` path so the
+    /// outbound connection originates from the requested source address.
     #[inline]
     #[cfg(not(feature = "turmoil"))]
     async fn connect_tungstenite(
         url: &str,
         headers: Vec<(String, String)>,
+        local_addr: Option<std::net::IpAddr>,
     ) -> Result<(MessageWriter, MessageReader), TransportError> {
         let mut request = url.into_client_request().map_err(TransportError::from)?;
         let req_headers = request.headers_mut();
@@ -414,6 +432,78 @@ impl WebSocketClientInner {
                 .parse()
                 .map_err(|e| TransportError::Handshake(format!("invalid header name: {e}")))?;
             req_headers.insert(header_name, header_value);
+        }
+
+        if let Some(local_ip) = local_addr {
+            // Source-IP-pinned path. Resolve the host, build a TcpSocket bound
+            // to the requested local IP, connect, optionally wrap in TLS, then
+            // perform the WebSocket handshake. Mirrors `connect_async_with_config`
+            // semantics but with explicit source-address control.
+            use std::net::SocketAddr;
+
+            use tokio::net::{TcpSocket, lookup_host};
+            use tokio_tungstenite::{
+                MaybeTlsStream, Connector, client_async_tls_with_config,
+            };
+
+            let uri = request.uri();
+            let scheme = uri.scheme_str().unwrap_or("ws");
+            let host = uri
+                .host()
+                .ok_or_else(|| TransportError::InvalidUrl("missing hostname".to_string()))?
+                .to_string();
+            let port = uri
+                .port_u16()
+                .unwrap_or_else(|| if scheme == "wss" { 443 } else { 80 });
+
+            // Resolve the target host to the address family matching `local_ip`.
+            let lookup_addr = format!("{host}:{port}");
+            let mut peer_addr: Option<SocketAddr> = None;
+            for candidate in lookup_host(&lookup_addr).await.map_err(TransportError::Io)? {
+                let family_match = matches!(
+                    (local_ip, candidate),
+                    (std::net::IpAddr::V4(_), SocketAddr::V4(_))
+                        | (std::net::IpAddr::V6(_), SocketAddr::V6(_))
+                );
+                if family_match {
+                    peer_addr = Some(candidate);
+                    break;
+                }
+            }
+            let peer = peer_addr.ok_or_else(|| {
+                TransportError::Io(std::io::Error::new(
+                    std::io::ErrorKind::AddrNotAvailable,
+                    format!(
+                        "no DNS result for '{host}' matched the address family of local_addr {local_ip}"
+                    ),
+                ))
+            })?;
+
+            let socket = match local_ip {
+                std::net::IpAddr::V4(_) => TcpSocket::new_v4().map_err(TransportError::Io)?,
+                std::net::IpAddr::V6(_) => TcpSocket::new_v6().map_err(TransportError::Io)?,
+            };
+            socket
+                .bind(SocketAddr::new(local_ip, 0))
+                .map_err(TransportError::Io)?;
+            let tcp_stream = socket.connect(peer).await.map_err(TransportError::Io)?;
+            if let Err(e) = tcp_stream.set_nodelay(true) {
+                log::warn!("Failed to enable TCP_NODELAY on local_addr-bound stream: {e:?}");
+            }
+
+            let connector: Option<Connector> = None;
+            let (stream, _resp) = if scheme == "wss" {
+                client_async_tls_with_config(request, tcp_stream, None, connector)
+                    .await
+                    .map_err(TransportError::from)?
+            } else {
+                let (s, r) = tokio_tungstenite::client_async(request, MaybeTlsStream::Plain(tcp_stream))
+                    .await
+                    .map_err(TransportError::from)?;
+                (s, r)
+            };
+            let transport: BoxedWsTransport = Box::pin(TungsteniteTransport::new(stream));
+            return Ok(transport.split());
         }
 
         let (stream, _resp) = connect_async_with_config(request, None, true)
@@ -444,7 +534,7 @@ impl WebSocketClientInner {
                     "WebSocket proxy_url scheme '{scheme}' is not yet supported; \
                      connecting without a WebSocket proxy"
                 );
-                return Self::connect_tungstenite(url, headers).await;
+                return Self::connect_tungstenite(url, headers, None).await;
             }
         };
 
@@ -505,11 +595,15 @@ impl WebSocketClientInner {
 
     /// Connects with the server creating a tokio-tungstenite websocket stream.
     /// Turmoil version that uses the lower-level `client_async` API with injected stream.
+    ///
+    /// `local_addr` is accepted for API symmetry with the production variant
+    /// but is ignored — the simulator does not model multi-homed source IPs.
     #[inline]
     #[cfg(feature = "turmoil")]
     async fn connect_tungstenite(
         url: &str,
         headers: Vec<(String, String)>,
+        _local_addr: Option<std::net::IpAddr>,
     ) -> Result<(MessageWriter, MessageReader), TransportError> {
         let mut request = url.into_client_request().map_err(TransportError::from)?;
         let req_headers = request.headers_mut();
@@ -797,6 +891,7 @@ impl WebSocketClientInner {
                 self.config.headers.clone(),
                 self.config.backend,
                 self.config.proxy_url.as_deref(),
+                self.config.local_addr,
             )
             .await?;
 
@@ -1370,6 +1465,7 @@ impl WebSocketClient {
             config.headers.clone(),
             config.backend,
             config.proxy_url.as_deref(),
+            config.local_addr,
         )
         .await?;
 
@@ -2109,6 +2205,7 @@ mod tests {
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
+            local_addr: None,
         };
         WebSocketClient::connect(config, Some(Arc::new(|_| {})), None, None, vec![], None)
             .await
@@ -2155,6 +2252,7 @@ mod tests {
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
+            local_addr: None,
         };
         let res =
             WebSocketClient::connect(config, Some(Arc::new(|_| {})), None, None, vec![], None)
@@ -2203,6 +2301,7 @@ mod tests {
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
+            local_addr: None,
         };
 
         let client = WebSocketClient::connect(
@@ -2427,6 +2526,7 @@ mod rust_tests {
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
+            local_addr: None,
         };
 
         // Connect the client
@@ -2474,6 +2574,7 @@ mod rust_tests {
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
+            local_addr: None,
         };
 
         let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
@@ -2526,6 +2627,7 @@ mod rust_tests {
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
+            local_addr: None,
         };
 
         let (_reader, _client) = WebSocketClient::connect_stream(config, vec![], None, None)
@@ -2575,6 +2677,7 @@ mod rust_tests {
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
+            local_addr: None,
         };
 
         let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
@@ -2650,6 +2753,7 @@ mod rust_tests {
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
+            local_addr: None,
         };
 
         let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
@@ -2712,6 +2816,7 @@ mod rust_tests {
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
+            local_addr: None,
         };
 
         let (mut reader, client) = WebSocketClient::connect_stream(config, vec![], None, None)
@@ -2797,6 +2902,7 @@ mod rust_tests {
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
+            local_addr: None,
         };
 
         let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
@@ -2883,6 +2989,7 @@ mod rust_tests {
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
+            local_addr: None,
         };
 
         let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
@@ -2970,6 +3077,7 @@ mod rust_tests {
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
+            local_addr: None,
         };
 
         // Very restrictive rate limit: 1 request per second, burst of 1
@@ -3063,6 +3171,7 @@ mod rust_tests {
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
+            local_addr: None,
         };
 
         let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
@@ -3130,6 +3239,7 @@ mod rust_tests {
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
+            local_addr: None,
         };
 
         // Very restrictive rate limit: 1 request per 10 seconds
@@ -3209,6 +3319,7 @@ mod rust_tests {
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
+            local_addr: None,
         };
 
         // Pass None for message_handler - should be rejected
@@ -3259,6 +3370,7 @@ mod rust_tests {
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
+            local_addr: None,
         };
 
         // Create client directly via connect_url with no handler (stream mode)
@@ -3308,6 +3420,7 @@ mod rust_tests {
             idle_timeout_ms: Some(500),
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
+            local_addr: None,
         };
 
         let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
@@ -3368,6 +3481,7 @@ mod rust_tests {
             idle_timeout_ms: Some(1_000),
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
+            local_addr: None,
         };
 
         let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
@@ -3428,6 +3542,7 @@ mod rust_tests {
             idle_timeout_ms: Some(500),
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
+            local_addr: None,
         };
 
         let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
@@ -3497,6 +3612,7 @@ mod rust_tests {
             idle_timeout_ms: Some(1_500),
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
+            local_addr: None,
         };
 
         let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
@@ -3557,6 +3673,7 @@ mod rust_tests {
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
+            local_addr: None,
         };
 
         let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
@@ -3628,6 +3745,7 @@ mod rust_tests {
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
+            local_addr: None,
         };
 
         // Very restrictive: 1 req per 60 seconds
@@ -3724,6 +3842,7 @@ mod rust_tests {
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
+            local_addr: None,
         };
 
         let (_reader, client) = WebSocketClient::connect_stream(config, vec![], None, None)
@@ -3776,6 +3895,7 @@ mod rust_tests {
             vec![],
             TransportBackend::Tungstenite,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3805,6 +3925,7 @@ mod rust_tests {
             &url,
             vec![],
             TransportBackend::Tungstenite,
+            None,
             None,
         )
         .await
@@ -3851,6 +3972,7 @@ mod rust_tests {
             vec![],
             TransportBackend::Tungstenite,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3880,6 +4002,7 @@ mod rust_tests {
             &url,
             vec![],
             TransportBackend::Tungstenite,
+            None,
             None,
         )
         .await
@@ -3931,6 +4054,7 @@ mod rust_tests {
             idle_timeout_ms: Some(0),
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
+            local_addr: None,
         };
 
         let result =
@@ -3964,6 +4088,7 @@ mod rust_tests {
             idle_timeout_ms: None,
             backend: TransportBackend::Sockudo,
             proxy_url: None,
+            local_addr: None,
         };
 
         let err = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
@@ -4022,6 +4147,7 @@ mod rust_tests {
             idle_timeout_ms: None,
             backend: TransportBackend::Sockudo,
             proxy_url: None,
+            local_addr: None,
         };
 
         let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
@@ -4100,6 +4226,7 @@ mod rust_tests {
             idle_timeout_ms: None,
             backend: TransportBackend::Sockudo,
             proxy_url: None,
+            local_addr: None,
         };
 
         let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
@@ -4177,6 +4304,7 @@ mod rust_tests {
             idle_timeout_ms: None,
             backend: TransportBackend::Sockudo,
             proxy_url: None,
+            local_addr: None,
         };
 
         let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
@@ -4475,6 +4603,7 @@ mod turmoil_tests {
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
+            local_addr: None,
         }
     }
 

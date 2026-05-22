@@ -14,6 +14,8 @@
 // -------------------------------------------------------------------------------------------------
 
 use std::{
+    net::IpAddr,
+    str::FromStr,
     sync::{
         Arc,
         atomic::{AtomicU8, Ordering},
@@ -86,6 +88,7 @@ impl WebSocketConfig {
         reconnect_max_attempts=None,
         idle_timeout_ms=None,
         proxy_url=None,
+        local_addr=None,
     ))]
     fn py_new(
         url: String,
@@ -100,8 +103,15 @@ impl WebSocketConfig {
         reconnect_max_attempts: Option<u32>,
         idle_timeout_ms: Option<u64>,
         proxy_url: Option<String>,
-    ) -> Self {
-        Self {
+        local_addr: Option<String>,
+    ) -> PyResult<Self> {
+        let local_addr_parsed = match local_addr {
+            Some(addr_str) => Some(IpAddr::from_str(&addr_str).map_err(|e| {
+                to_pyvalue_err(format!("Invalid local_addr '{addr_str}': {e}"))
+            })?),
+            None => None,
+        };
+        Ok(Self {
             url,
             headers,
             heartbeat,
@@ -115,7 +125,8 @@ impl WebSocketConfig {
             idle_timeout_ms,
             backend: TransportBackend::default(),
             proxy_url,
-        }
+            local_addr: local_addr_parsed,
+        })
     }
 }
 

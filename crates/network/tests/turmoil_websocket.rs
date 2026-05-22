@@ -79,6 +79,7 @@ fn websocket_config() -> WebSocketConfig {
         idle_timeout_ms: None,
         backend: TransportBackend::Tungstenite,
         proxy_url: None,
+        local_addr: None,
     }
 }
 

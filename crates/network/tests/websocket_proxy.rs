@@ -222,6 +222,7 @@ async fn websocket_client_routes_through_http_connect_proxy() {
         idle_timeout_ms: None,
         backend: TransportBackend::Tungstenite,
         proxy_url: Some(proxy_url),
+        local_addr: None,
     };
 
     let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
@@ -273,6 +274,7 @@ async fn websocket_client_falls_back_to_direct_for_socks_proxy() {
         idle_timeout_ms: None,
         backend: TransportBackend::Tungstenite,
         proxy_url: Some("socks5://127.0.0.1:1080".to_string()),
+        local_addr: None,
     };
 
     let handler: MessageHandler = Arc::new(|_| {});
@@ -365,6 +367,7 @@ async fn websocket_client_emits_proxy_authorization_header() {
         idle_timeout_ms: None,
         backend: TransportBackend::Tungstenite,
         proxy_url: Some(proxy_url),
+        local_addr: None,
     };
 
     let handler: MessageHandler = Arc::new(|_| {});
@@ -408,6 +411,7 @@ async fn websocket_client_reuses_proxy_url_on_reconnect() {
         idle_timeout_ms: None,
         backend: TransportBackend::Tungstenite,
         proxy_url: Some(format!("http://{proxy_addr}")),
+        local_addr: None,
     };
 
     let handler: MessageHandler = Arc::new(|_| {});

@@ -477,6 +477,7 @@ impl DydxWebSocketClient {
             idle_timeout_ms: None,
             backend: self.transport_backend,
             proxy_url: self.proxy_url.clone(),
+            local_addr: None,
         };
 
         let client = WebSocketClient::connect(

@@ -77,6 +77,7 @@ fn websocket_config() -> WebSocketConfig {
         idle_timeout_ms: None,
         backend: TransportBackend::Sockudo,
         proxy_url: None,
+        local_addr: None,
     }
 }
 
