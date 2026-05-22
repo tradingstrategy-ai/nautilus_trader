@@ -186,6 +186,7 @@ impl HyperliquidExecutionClient {
             Some(core.account_id),
             config.transport_backend,
             config.proxy_url.clone(),
+            None,
         );
         ws_client.set_post_timeout(Duration::from_secs(config.ws_post_timeout_secs));
 
@@ -2377,6 +2378,7 @@ mod tests {
             HyperliquidEnvironment::Testnet,
             None,
             TransportBackend::default(),
+            None,
             None,
         )
     }

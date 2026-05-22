@@ -325,6 +325,7 @@ async fn connect_client(ws_url: &str, account_id: Option<AccountId>) -> Hyperliq
         account_id,
         TransportBackend::default(),
         None,
+        None,
     );
     cache_test_instruments(&mut client);
     client

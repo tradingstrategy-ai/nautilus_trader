@@ -133,6 +133,16 @@ pub struct HyperliquidWebSocketClient {
     account_id: Option<AccountId>,
     transport_backend: TransportBackend,
     proxy_url: Option<String>,
+    /// Optional source-IP binding for outbound WS TCP connections.
+    ///
+    /// When set, the underlying `WebSocketConfig.local_addr` propagates to
+    /// `reqwest::ClientBuilder::local_address` / `TcpSocket::bind`, so every
+    /// outbound WS socket from this client originates from the given IP.
+    /// Used together with `HyperliquidRawHttpClient`'s `local_addrs_rest`
+    /// to pin REST + WS traffic to a known source IP at the application
+    /// layer.  When `None`, the kernel selects the source IP from the
+    /// routing table.
+    local_addr: Option<std::net::IpAddr>,
 }
 
 impl Clone for HyperliquidWebSocketClient {
@@ -157,6 +167,7 @@ impl Clone for HyperliquidWebSocketClient {
             account_id: self.account_id,
             transport_backend: self.transport_backend,
             proxy_url: self.proxy_url.clone(),
+            local_addr: self.local_addr,
         }
     }
 }
@@ -175,6 +186,7 @@ impl HyperliquidWebSocketClient {
         account_id: Option<AccountId>,
         transport_backend: TransportBackend,
         proxy_url: Option<String>,
+        local_addr: Option<std::net::IpAddr>,
     ) -> Self {
         let url = url.unwrap_or_else(|| ws_url(environment).to_string());
         let connection_mode = Arc::new(ArcSwap::new(Arc::new(AtomicU8::new(
@@ -204,6 +216,7 @@ impl HyperliquidWebSocketClient {
             account_id,
             transport_backend,
             proxy_url,
+            local_addr,
         }
     }
 
@@ -228,7 +241,7 @@ impl HyperliquidWebSocketClient {
             idle_timeout_ms: None,
             backend: self.transport_backend,
             proxy_url: self.proxy_url.clone(),
-            local_addr: None,
+            local_addr: self.local_addr,
         };
         let client =
             WebSocketClient::connect(cfg, Some(message_handler), None, None, vec![], None).await?;
@@ -1913,6 +1926,7 @@ mod tests {
             None,
             TransportBackend::default(),
             None,
+            None,
         );
         let timeout = std::time::Duration::from_secs(7);
 
@@ -1930,6 +1944,7 @@ mod tests {
             HyperliquidEnvironment::Testnet,
             None,
             TransportBackend::default(),
+            None,
             None,
         );
         let mut receivers = Vec::with_capacity(INFLIGHT_MAX);

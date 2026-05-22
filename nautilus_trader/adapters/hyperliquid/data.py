@@ -161,11 +161,15 @@ class HyperliquidDataClient(LiveMarketDataClient):
         self._http_client = client
         self._log.info("HTTP client initialized", LogColor.BLUE)
 
-        # WebSocket client for market data
+        # WebSocket client for market data.  ``local_addr`` pins outbound
+        # WS sockets to a specific source IP at the application layer —
+        # paired with the HTTP client's ``local_addrs_rest`` pool to keep
+        # REST + WS traffic on the same set of pinned IPs (PR #4 contract).
         self._ws_client = nautilus_pyo3.HyperliquidWebSocketClient(
             url=config.base_url_ws,
             environment=environment,
             proxy_url=config.proxy_url,
+            local_addr=config.local_addr,
         )
 
     @property

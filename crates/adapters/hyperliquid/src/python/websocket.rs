@@ -15,7 +15,7 @@
 
 //! Python bindings for the Hyperliquid WebSocket client.
 
-use std::time::Duration;
+use std::{net::IpAddr, str::FromStr, time::Duration};
 
 use nautilus_common::live::get_runtime;
 use nautilus_core::python::{call_python_threadsafe, to_pyruntime_err, to_pyvalue_err};
@@ -57,21 +57,35 @@ impl HyperliquidWebSocketClient {
     /// Orchestrates WebSocket connection and subscriptions using a command-based architecture,
     /// where the inner FeedHandler owns the WebSocketClient and handles all I/O.
     #[new]
-    #[pyo3(signature = (url=None, environment=HyperliquidEnvironment::Mainnet, account_id=None, proxy_url=None))]
+    #[pyo3(signature = (url=None, environment=HyperliquidEnvironment::Mainnet, account_id=None, proxy_url=None, local_addr=None))]
     fn py_new(
         url: Option<String>,
         environment: HyperliquidEnvironment,
         account_id: Option<String>,
         proxy_url: Option<String>,
-    ) -> Self {
+        local_addr: Option<String>,
+    ) -> PyResult<Self> {
         let account_id = account_id.map(|s| AccountId::from(s.as_str()));
-        Self::new(
+        // Parse the optional source-IP literal.  Trimmed-empty resolves to
+        // `None` (kernel default).  Anything that fails ``IpAddr::from_str``
+        // surfaces as a Python ``ValueError`` with the offending value in
+        // the message — matches the HL HTTP adapter's ``local_addrs_rest``
+        // validation shape.
+        let parsed_local_addr = match &local_addr {
+            Some(s) if !s.trim().is_empty() => Some(
+                IpAddr::from_str(s.trim())
+                    .map_err(|e| to_pyvalue_err(format!("Invalid local_addr '{s}': {e}")))?,
+            ),
+            _ => None,
+        };
+        Ok(Self::new(
             url,
             environment,
             account_id,
             TransportBackend::default(),
             proxy_url,
-        )
+            parsed_local_addr,
+        ))
     }
 
     /// Returns the URL of this WebSocket client.

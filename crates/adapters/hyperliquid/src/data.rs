@@ -129,6 +129,7 @@ impl HyperliquidDataClient {
             None,
             config.transport_backend,
             config.proxy_url.clone(),
+            None,
         );
 
         Ok(Self {

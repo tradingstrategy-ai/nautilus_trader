@@ -137,12 +137,17 @@ class HyperliquidExecutionClient(LiveExecutionClient):
         account_id = AccountId(f"{name or HYPERLIQUID_VENUE.value}-master")
         self._set_account_id(account_id)
 
-        # WebSocket client for order/execution updates (user-level, not product-specific)
+        # WebSocket client for order/execution updates (user-level, not product-specific).
+        # ``local_addr`` pins outbound WS sockets to a specific source IP at
+        # the application layer — paired with the HTTP client's
+        # ``local_addrs_rest`` pool to keep REST + WS traffic on the same
+        # set of pinned IPs (PR #4 contract).
         self._ws_client = nautilus_pyo3.HyperliquidWebSocketClient(
             url=config.base_url_ws,
             environment=environment,
             account_id=str(account_id),
             proxy_url=config.proxy_url,
+            local_addr=config.local_addr,
         )
         self._ws_client.set_post_timeout(config.ws_post_timeout_secs)
 
