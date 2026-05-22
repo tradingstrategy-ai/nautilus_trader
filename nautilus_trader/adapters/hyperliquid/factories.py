@@ -41,18 +41,8 @@ if TYPE_CHECKING:
 
 def _resolve_environment(
     environment: HyperliquidEnvironment | None,
-    testnet: bool | None = None,
 ) -> HyperliquidEnvironment:
-    # ``environment`` takes precedence if set.  Otherwise fall back to
-    # the backwards-compat ``testnet`` boolean (legacy strategies-side
-    # config kept passing it after the upstream rebase to v1.228 that
-    # replaced the boolean with the enum).  If neither is set, default
-    # to MAINNET — matches upstream's pyo3 default.
-    if environment is not None:
-        return environment
-    if testnet is True:
-        return HyperliquidEnvironment.TESTNET
-    return HyperliquidEnvironment.MAINNET
+    return environment or HyperliquidEnvironment.MAINNET
 
 
 @lru_cache(1)
@@ -220,7 +210,7 @@ class HyperliquidLiveDataClientFactory(LiveDataClientFactory):
         HyperliquidDataClient
 
         """
-        environment = _resolve_environment(config.environment, config.testnet)
+        environment = _resolve_environment(config.environment)
         client = get_cached_hyperliquid_http_client(
             timeout_secs=config.http_timeout_secs,
             environment=environment,
@@ -284,7 +274,7 @@ class HyperliquidLiveExecClientFactory(LiveExecClientFactory):
         HyperliquidExecutionClient
 
         """
-        environment = _resolve_environment(config.environment, config.testnet)
+        environment = _resolve_environment(config.environment)
         client = get_cached_hyperliquid_http_client(
             private_key=config.private_key,
             vault_address=config.vault_address,
