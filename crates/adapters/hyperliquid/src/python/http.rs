@@ -32,9 +32,14 @@ use pyo3::{IntoPyObjectExt, prelude::*, types::PyList};
 use rust_decimal::Decimal;
 use serde_json::to_string;
 
+use std::str::FromStr;
+
 use crate::{
     common::enums::HyperliquidEnvironment,
-    http::{client::HyperliquidHttpClient, parse::HyperliquidMarketType},
+    http::{
+        client::{HyperliquidHttpClient, parse_addr_list},
+        parse::HyperliquidMarketType,
+    },
 };
 
 #[pymethods]
@@ -46,7 +51,19 @@ impl HyperliquidHttpClient {
     /// with Nautilus domain types. It maintains an instrument cache and handles conversions
     /// between Hyperliquid API responses and Nautilus domain models.
     #[new]
-    #[pyo3(signature = (private_key=None, vault_address=None, account_address=None, environment=HyperliquidEnvironment::Mainnet, timeout_secs=60, proxy_url=None, normalize_prices=true, include_builder_attribution=true))]
+    #[pyo3(signature = (
+        private_key=None,
+        vault_address=None,
+        account_address=None,
+        environment=HyperliquidEnvironment::Mainnet,
+        timeout_secs=60,
+        proxy_url=None,
+        normalize_prices=true,
+        include_builder_attribution=true,
+        local_addrs_rest=None,
+        local_addrs_ws=None,
+        ws_shard_by=None,
+    ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
         private_key: Option<String>,
@@ -57,15 +74,43 @@ impl HyperliquidHttpClient {
         proxy_url: Option<String>,
         normalize_prices: bool,
         include_builder_attribution: bool,
+        local_addrs_rest: Option<Vec<String>>,
+        local_addrs_ws: Option<Vec<String>>,
+        ws_shard_by: Option<String>,
     ) -> PyResult<Self> {
-        let mut client = Self::with_credentials(
-            private_key,
-            vault_address,
-            account_address,
-            environment,
-            timeout_secs,
-            proxy_url,
-        )
+        let rest_addrs = parse_addr_list("local_addrs_rest", &local_addrs_rest)
+            .map_err(to_pyvalue_err)?;
+        parse_addr_list("local_addrs_ws", &local_addrs_ws).map_err(to_pyvalue_err)?;
+        if let Some(mode) = ws_shard_by.as_deref()
+            && !mode.is_empty()
+            && mode != "instrument"
+            && mode != "round_robin"
+        {
+            return Err(to_pyvalue_err(format!(
+                "Unknown ws_shard_by '{mode}', expected: instrument, round_robin"
+            )));
+        }
+
+        let mut client = if rest_addrs.is_empty() {
+            Self::with_credentials(
+                private_key,
+                vault_address,
+                account_address,
+                environment,
+                timeout_secs,
+                proxy_url,
+            )
+        } else {
+            Self::with_credentials_and_pool(
+                private_key,
+                vault_address,
+                account_address.map(str::to_string),
+                environment,
+                timeout_secs,
+                proxy_url,
+                rest_addrs,
+            )
+        }
         .map_err(to_pyvalue_err)?;
         client.set_normalize_prices(normalize_prices);
         client.set_include_builder_attribution(include_builder_attribution);
@@ -969,4 +1014,17 @@ impl HyperliquidHttpClient {
             to_string(&response).map_err(to_pyvalue_err)
         })
     }
+}
+
+/// Wraps [`parse_addr_list`] from `http::client`, mapping the `String` error
+/// to a `PyErr`.
+///
+/// Returns an empty Vec if the input is `None` or all entries are
+/// empty/whitespace. Returns a [`PyErr`] if any non-empty entry fails to
+/// parse as an [`std::net::IpAddr`].
+fn resolve_addr_list(
+    field_name: &str,
+    raw: &Option<Vec<String>>,
+) -> PyResult<Vec<std::net::IpAddr>> {
+    parse_addr_list(field_name, raw).map_err(to_pyvalue_err)
 }

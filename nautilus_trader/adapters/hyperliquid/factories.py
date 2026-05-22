@@ -55,6 +55,9 @@ def get_cached_hyperliquid_http_client(
     proxy_url: str | None = None,
     normalize_prices: bool = True,
     include_builder_attribution: bool = True,
+    local_addrs_rest: tuple[str, ...] | None = None,
+    local_addrs_ws: tuple[str, ...] | None = None,
+    ws_shard_by: str | None = None,
 ) -> nautilus_pyo3.HyperliquidHttpClient:
     """
     Cache and return a Hyperliquid HTTP client with the given parameters.
@@ -105,6 +108,15 @@ def get_cached_hyperliquid_http_client(
 
     if timeout_secs is not None:
         kwargs["timeout_secs"] = timeout_secs
+
+    # Multi-IP fields — pyo3 wants list[str], not tuple. Drop when empty
+    # so the pyo3 default (None / kernel-default source IP) kicks in.
+    if local_addrs_rest:
+        kwargs["local_addrs_rest"] = list(local_addrs_rest)
+    if local_addrs_ws:
+        kwargs["local_addrs_ws"] = list(local_addrs_ws)
+    if ws_shard_by:
+        kwargs["ws_shard_by"] = ws_shard_by
 
     return nautilus_pyo3.HyperliquidHttpClient(**kwargs)
 
@@ -192,6 +204,9 @@ class HyperliquidLiveDataClientFactory(LiveDataClientFactory):
             timeout_secs=config.http_timeout_secs,
             environment=environment,
             proxy_url=config.proxy_url,
+            local_addrs_rest=config.local_addrs_rest,
+            local_addrs_ws=config.local_addrs_ws,
+            ws_shard_by=config.ws_shard_by,
         )
         provider = get_cached_hyperliquid_instrument_provider(
             client=client,
@@ -264,6 +279,9 @@ class HyperliquidLiveExecClientFactory(LiveExecClientFactory):
             proxy_url=config.proxy_url,
             normalize_prices=config.normalize_prices,
             include_builder_attribution=config.include_builder_attribution,
+            local_addrs_rest=config.local_addrs_rest,
+            local_addrs_ws=config.local_addrs_ws,
+            ws_shard_by=config.ws_shard_by,
         )
         provider = get_cached_hyperliquid_instrument_provider(
             client=client,

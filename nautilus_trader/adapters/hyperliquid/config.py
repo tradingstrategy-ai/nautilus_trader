@@ -50,6 +50,9 @@ class HyperliquidDataClientConfig(LiveDataClientConfig, frozen=True):
     proxy_url: str | None = None
     transport_backend: TransportBackend | None = None
     http_timeout_secs: PositiveInt = 10
+    local_addrs_rest: tuple[str, ...] | None = None
+    local_addrs_ws: tuple[str, ...] | None = None
+    ws_shard_by: str | None = None
 
 
 class HyperliquidExecClientConfig(LiveExecClientConfig, frozen=True):
@@ -124,3 +127,6 @@ class HyperliquidExecClientConfig(LiveExecClientConfig, frozen=True):
     ws_post_timeout_secs: PositiveInt = 10
     normalize_prices: bool = True
     include_builder_attribution: bool = True
+    local_addrs_rest: tuple[str, ...] | None = None
+    local_addrs_ws: tuple[str, ...] | None = None
+    ws_shard_by: str | None = None
