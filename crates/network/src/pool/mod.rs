@@ -30,8 +30,10 @@ use siphasher::sip::SipHasher13;
 use crate::ratelimiter::quota::Quota;
 
 pub mod http_pool;
+pub mod ws_pool;
 
 pub use http_pool::HttpPool;
+pub use ws_pool::{WsConnectArgs, WsPool};
 
 /// Hint that callers pass into a pool to influence which slot is picked.
 ///
