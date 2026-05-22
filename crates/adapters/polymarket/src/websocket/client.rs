@@ -350,6 +350,7 @@ impl PolymarketWebSocketClient {
             idle_timeout_ms: Some(idle_timeout_ms_for(self.channel)),
             backend: self.transport_backend,
             proxy_url: self.proxy_url.as_ref().map(|url| url.expose().to_string()),
+            local_addr: None,
         }
     }
 

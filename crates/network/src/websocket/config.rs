@@ -28,7 +28,7 @@
 //! seconds resets its attempt count and backoff delay; shorter-lived connections continue the
 //! current cycle.
 
-use std::fmt::Debug;
+use std::{fmt::Debug, net::IpAddr};
 
 use nautilus_core::string::secret::REDACTED;
 use serde::{Deserialize, Serialize};
@@ -178,6 +178,13 @@ pub struct WebSocketConfig {
     /// `http://` and `https://` schemes; SOCKS schemes are not yet supported.
     #[serde(default)]
     pub proxy_url: Option<String>,
+    /// Optional local source IP to bind outbound TCP connections to.
+    ///
+    /// When set, direct WebSocket connections originate from this address.
+    /// When unset, the kernel selects the source address. The turmoil backend
+    /// accepts this value for API symmetry but does not model source binding.
+    #[serde(default)]
+    pub local_addr: Option<IpAddr>,
 }
 
 impl Debug for WebSocketConfig {
@@ -202,6 +209,7 @@ impl Debug for WebSocketConfig {
             .field("idle_timeout_ms", &self.idle_timeout_ms)
             .field("backend", &self.backend)
             .field("proxy_url", &self.proxy_url.as_ref().map(|_| REDACTED))
+            .field("local_addr", &self.local_addr)
             .finish()
     }
 }

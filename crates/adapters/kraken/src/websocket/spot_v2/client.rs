@@ -265,6 +265,7 @@ impl KrakenSpotWebSocketClient {
                 .then_some(self.config.ws_idle_timeout_ms),
             backend: self.transport_backend,
             proxy_url: self.proxy_url.clone(),
+            local_addr: None,
         };
 
         let keyed_quotas = vec![

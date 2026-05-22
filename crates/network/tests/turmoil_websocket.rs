@@ -160,6 +160,7 @@ fn websocket_config_for_backend(backend: TransportBackend) -> WebSocketConfig {
         idle_timeout_ms: None,
         backend,
         proxy_url: None,
+        local_addr: None,
     }
 }
 

@@ -14,6 +14,8 @@
 // -------------------------------------------------------------------------------------------------
 
 use std::{
+    net::IpAddr,
+    str::FromStr,
     sync::{
         Arc,
         atomic::{AtomicU8, Ordering},
@@ -91,6 +93,7 @@ impl WebSocketConfig {
         idle_timeout_ms=None,
         proxy_url=None,
         backend=None,
+        local_addr=None,
     ))]
     fn py_new(
         url: String,
@@ -106,7 +109,14 @@ impl WebSocketConfig {
         idle_timeout_ms: Option<u64>,
         proxy_url: Option<String>,
         backend: Option<TransportBackend>,
+        local_addr: Option<String>,
     ) -> PyResult<Self> {
+        let local_addr = local_addr
+            .map(|addr| {
+                IpAddr::from_str(&addr)
+                    .map_err(|e| to_pyvalue_err(format!("Invalid local_addr '{addr}': {e}")))
+            })
+            .transpose()?;
         let config = Self {
             url,
             headers,
@@ -121,6 +131,7 @@ impl WebSocketConfig {
             idle_timeout_ms,
             backend: backend.unwrap_or_default(),
             proxy_url,
+            local_addr,
         };
         config.validate().map_err(to_pyvalue_err)?;
         Ok(config)
@@ -202,6 +213,12 @@ impl WebSocketConfig {
     #[pyo3(name = "has_proxy_url")]
     fn py_has_proxy_url(&self) -> bool {
         self.proxy_url.is_some()
+    }
+
+    #[getter]
+    #[pyo3(name = "local_addr")]
+    fn py_local_addr(&self) -> Option<String> {
+        self.local_addr.map(|addr| addr.to_string())
     }
 }
 
