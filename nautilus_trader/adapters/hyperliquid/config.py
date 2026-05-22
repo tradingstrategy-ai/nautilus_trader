@@ -45,6 +45,12 @@ class HyperliquidDataClientConfig(LiveDataClientConfig, frozen=True):
 
     product_types: tuple[HyperliquidProductType, ...] | None = None
     environment: HyperliquidEnvironment | None = None
+    # Backwards-compat with the pre-rebase ``testnet: bool`` field that
+    # strategies-side runners (run_vault, run_agent_contrarian,
+    # run_open_rwa) all pass directly.  Resolution: if ``environment``
+    # is set, it takes precedence; else if ``testnet=True`` we resolve
+    # to TESTNET, else MAINNET (the same default as upstream).
+    testnet: bool | None = None
     base_url_ws: str | None = None
     proxy_url: str | None = None
     http_timeout_secs: PositiveInt = 10
@@ -121,6 +127,9 @@ class HyperliquidExecClientConfig(LiveExecClientConfig, frozen=True):
     account_address: str | None = None
     product_types: tuple[HyperliquidProductType, ...] | None = None
     environment: HyperliquidEnvironment | None = None
+    # Backwards-compat with the pre-rebase ``testnet: bool`` field —
+    # see HyperliquidDataClientConfig for resolution semantics.
+    testnet: bool | None = None
     base_url_ws: str | None = None
     proxy_url: str | None = None
     max_retries: PositiveInt | None = None
