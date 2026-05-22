@@ -48,6 +48,11 @@ class HyperliquidDataClientConfig(LiveDataClientConfig, frozen=True):
     base_url_ws: str | None = None
     proxy_url: str | None = None
     http_timeout_secs: PositiveInt = 10
+    # Singular source-IP pin (backwards-compat with PR #4 / HL_LOCAL_ADDR).
+    # When set without `local_addrs_rest`, the factory treats it as a
+    # 1-entry REST pool. When both are set, `local_addrs_rest` takes
+    # precedence and `local_addr` is ignored.
+    local_addr: str | None = None
     # Multi-IP REST pool: when set, REST traffic round-robins across the
     # listed source IPs. Each IP must be assigned to a NIC on the host.
     local_addrs_rest: tuple[str, ...] | None = None
@@ -124,6 +129,9 @@ class HyperliquidExecClientConfig(LiveExecClientConfig, frozen=True):
     http_timeout_secs: PositiveInt = 10
     ws_post_timeout_secs: PositiveInt = 10
     normalize_prices: bool = True
+    # Singular source-IP pin (backwards-compat with PR #4 / HL_LOCAL_ADDR).
+    # See HyperliquidDataClientConfig for resolution semantics.
+    local_addr: str | None = None
     # Multi-IP REST pool: when set, REST traffic round-robins across the
     # listed source IPs. Each IP must be assigned to a NIC on the host.
     local_addrs_rest: tuple[str, ...] | None = None
