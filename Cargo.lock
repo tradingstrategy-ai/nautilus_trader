@@ -6293,6 +6293,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_urlencoded",
+ "siphasher",
  "sockudo-ws",
  "strum 0.28.0",
  "tempfile",

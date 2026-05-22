@@ -66,6 +66,7 @@ rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 serde = { workspace = true }
 serde_urlencoded = { workspace = true }
+siphasher = "1.0"
 strum = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
