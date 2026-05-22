@@ -16,13 +16,105 @@
 //! Multi-IP source-binding pools for HTTP and WebSocket clients.
 //!
 //! Provides the building blocks for a fan of clients each bound to a
-//! different local IP. This module currently exports the deterministic
-//! instrument-to-slot hash; the actual pool types are layered on top in
-//! follow-up commits.
+//! different local IP. This module exports the deterministic
+//! instrument-to-slot hash and the pick-hint enums that pool implementations
+//! consume.
 
-use std::hash::{Hash, Hasher};
+use std::{
+    collections::HashMap,
+    hash::{Hash, Hasher},
+};
 
 use siphasher::sip::SipHasher13;
+
+use crate::ratelimiter::quota::Quota;
+
+/// Hint that callers pass into a pool to influence which slot is picked.
+///
+/// `Stateless` requests can use any slot — round-robin gives the best
+/// rate-limit amortisation. `WalletPrivateChannel` subscriptions are
+/// pinned to slot 0 so the WS broker doesn't fan authentication across
+/// every slot. `MarketDataChannel` is sharded per [`ShardMode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickHint<'a> {
+    /// Stateless REST — round-robin via internal counter.
+    Stateless,
+    /// HL channels keyed by wallet address (`userFills`, `userFundings`,
+    /// `webData2`, `orderUpdates`). Pin to slot 0 to avoid duplicate
+    /// delivery across IPs.
+    WalletPrivateChannel {
+        /// Channel name carried for logging/metrics.
+        channel: &'a str,
+    },
+    /// Public market-data channels. Sharded per [`ShardMode`].
+    ///
+    /// `instrument` MUST be the raw venue symbol (e.g. HL `"BTC"`), NOT
+    /// the NT instrument ID (e.g. `"BTC-USD-PERP.HYPERLIQUID"`) — the NT
+    /// format has changed across NT versions and would silently re-shard.
+    MarketDataChannel {
+        /// Raw venue symbol.
+        instrument: &'a str,
+        /// Channel name (e.g. `"l2Book@BTC"`).
+        channel: &'a str,
+    },
+}
+
+/// How a pool decides which slot to use for a market-data request when no
+/// explicit pin is in effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShardMode {
+    /// Default. Per-instrument bucketing via [`slot_for_instrument`].
+    /// Keeps all of an instrument's channels co-located.
+    Instrument,
+    /// `AtomicUsize` counter. No locality. Escape hatch.
+    RoundRobin,
+}
+
+/// Errors returned by pool construction and pick paths.
+#[derive(Debug, thiserror::Error)]
+pub enum PoolError {
+    /// The pool was constructed with no slots.
+    #[error("pool constructed with zero IPs")]
+    Empty,
+    /// A configured IP string could not be parsed.
+    #[error("invalid IP address '{input}': {reason}")]
+    InvalidAddress {
+        /// The malformed input.
+        input: String,
+        /// The parse error.
+        reason: String,
+    },
+    /// Building a client bound to the requested local IP failed.
+    #[error("failed to bind to {address}: {cause}")]
+    BindFailed {
+        /// The local IP that failed to bind.
+        address: std::net::IpAddr,
+        /// Underlying error from the HTTP client builder.
+        cause: String,
+    },
+}
+
+/// Template carrying every argument `HttpClient::new_with_local_addr` takes
+/// except `local_addr` itself, which is filled per-slot by the pool.
+///
+/// Adapters typically pre-build a template once with their default headers
+/// and rate-limit quota, then hand it to the pool which fans it out across
+/// every configured IP.
+#[derive(Debug, Clone, Default)]
+pub struct HttpClientTemplate {
+    /// Static default headers (e.g. `User-Agent`).
+    pub headers: HashMap<String, String>,
+    /// Header keys to pre-intern (for rate-limit response parsing).
+    pub header_keys: Vec<String>,
+    /// Per-endpoint rate-limit quotas keyed by endpoint name.
+    pub keyed_quotas: Vec<(String, Quota)>,
+    /// Default quota applied when no keyed quota matches.
+    pub default_quota: Option<Quota>,
+    /// Optional overall request timeout in seconds.
+    pub timeout_secs: Option<u64>,
+    /// Optional forward HTTP proxy URL.
+    pub proxy_url: Option<String>,
+}
 
 /// Returns the slot index for an instrument, deterministic across process restarts.
 ///
@@ -47,6 +139,49 @@ pub fn slot_for_instrument(instrument: &str, n_slots: usize) -> usize {
     let mut hasher = SipHasher13::new_with_keys(0, 0);
     instrument.as_bytes().hash(&mut hasher);
     (hasher.finish() as usize) % n_slots
+}
+
+#[cfg(test)]
+mod type_tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use super::*;
+
+    #[test]
+    fn pickhint_variants_construct() {
+        let _h1 = PickHint::Stateless;
+        let _h2 = PickHint::WalletPrivateChannel {
+            channel: "userFills",
+        };
+        let _h3 = PickHint::MarketDataChannel {
+            instrument: "BTC",
+            channel: "l2Book@BTC",
+        };
+    }
+
+    #[test]
+    fn shardmode_variants_construct() {
+        let _ = ShardMode::Instrument;
+        let _ = ShardMode::RoundRobin;
+    }
+
+    #[test]
+    fn pool_error_variants_construct() {
+        let _e1 = PoolError::Empty;
+        let _e2 = PoolError::InvalidAddress {
+            input: "x".into(),
+            reason: "y".into(),
+        };
+        let _e3 = PoolError::BindFailed {
+            address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            cause: "z".into(),
+        };
+    }
+
+    #[test]
+    fn http_client_template_default() {
+        let _t = HttpClientTemplate::default();
+    }
 }
 
 #[cfg(test)]
