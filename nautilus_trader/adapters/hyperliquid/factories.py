@@ -55,6 +55,7 @@ def get_cached_hyperliquid_http_client(
     proxy_url: str | None = None,
     normalize_prices: bool = True,
     include_builder_attribution: bool = True,
+    local_addr: str | None = None,
     local_addrs_rest: tuple[str, ...] | None = None,
     local_addrs_ws: tuple[str, ...] | None = None,
     ws_shard_by: str | None = None,
@@ -111,8 +112,17 @@ def get_cached_hyperliquid_http_client(
 
     # Multi-IP fields — pyo3 wants list[str], not tuple. Drop when empty
     # so the pyo3 default (None / kernel-default source IP) kicks in.
+    #
+    # Resolution: `local_addrs_rest` (plural) > `local_addr` (singular)
+    # > kernel default. If the plural is present we keep it as-is and
+    # ignore the singular. If only the singular is set, treat it as a
+    # 1-entry pool (the pyo3 pool implementation has a singleton
+    # fast-path so this is overhead-free vs the old single-client
+    # codepath).
     if local_addrs_rest:
         kwargs["local_addrs_rest"] = list(local_addrs_rest)
+    elif local_addr:
+        kwargs["local_addrs_rest"] = [local_addr]
     if local_addrs_ws:
         kwargs["local_addrs_ws"] = list(local_addrs_ws)
     if ws_shard_by:
@@ -204,6 +214,7 @@ class HyperliquidLiveDataClientFactory(LiveDataClientFactory):
             timeout_secs=config.http_timeout_secs,
             environment=environment,
             proxy_url=config.proxy_url,
+            local_addr=config.local_addr,
             local_addrs_rest=config.local_addrs_rest,
             local_addrs_ws=config.local_addrs_ws,
             ws_shard_by=config.ws_shard_by,
@@ -279,6 +290,7 @@ class HyperliquidLiveExecClientFactory(LiveExecClientFactory):
             proxy_url=config.proxy_url,
             normalize_prices=config.normalize_prices,
             include_builder_attribution=config.include_builder_attribution,
+            local_addr=config.local_addr,
             local_addrs_rest=config.local_addrs_rest,
             local_addrs_ws=config.local_addrs_ws,
             ws_shard_by=config.ws_shard_by,
