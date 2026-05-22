@@ -30,6 +30,13 @@ arrow = [
 ]
 cython-compat = []
 defi = ["dep:nautilus-blockchain", "nautilus-blockchain/python"]
+# Empty alias: this crate's dependencies all already enable the `python` feature
+# of their respective sub-crates (see [dependencies] below — every entry has
+# `features = ["python"]`). This empty alias exists so
+# `cargo build -p nautilus-pyo3 -p <others> --features python` doesn't error
+# with "package 'nautilus-pyo3' does not contain this feature" — which is
+# what `build.py` invokes.
+python = []
 extension-module = [
   "nautilus-analysis/extension-module",
   "nautilus-architect-ax/extension-module",
