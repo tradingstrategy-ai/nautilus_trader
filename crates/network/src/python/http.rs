@@ -18,7 +18,9 @@ use std::{
     fs::File,
     hash::{Hash, Hasher},
     io::copy,
+    net::IpAddr,
     path::Path,
+    str::FromStr,
     time::Duration,
 };
 
@@ -122,7 +124,8 @@ impl HttpClient {
     /// built on top of `reqwest` and can be used for both synchronous and
     /// asynchronous HTTP requests.
     #[new]
-    #[pyo3(signature = (default_headers=HashMap::new(), header_keys=Vec::new(), keyed_quotas=Vec::new(), default_quota=None, timeout_secs=None, proxy_url=None))]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (default_headers=HashMap::new(), header_keys=Vec::new(), keyed_quotas=Vec::new(), default_quota=None, timeout_secs=None, proxy_url=None, local_addr=None))]
     pub fn py_new(
         default_headers: HashMap<String, String>,
         header_keys: Vec<String>,
@@ -130,14 +133,28 @@ impl HttpClient {
         default_quota: Option<Quota>,
         timeout_secs: Option<u64>,
         proxy_url: Option<String>,
+        local_addr: Option<String>,
     ) -> PyResult<Self> {
-        Self::new(
+        // Parse the optional local source-IP literal.  Trimmed/empty strings
+        // resolve to `None` (kernel default).  Anything that fails
+        // ``IpAddr::from_str`` surfaces as a Python ``ValueError`` with the
+        // offending value in the message — matches the ergonomics of the
+        // HL adapter's ``local_addr`` field.
+        let parsed_local_addr = match &local_addr {
+            Some(s) if !s.trim().is_empty() => Some(
+                IpAddr::from_str(s.trim())
+                    .map_err(|e| to_pyvalue_err(format!("Invalid local_addr '{s}': {e}")))?,
+            ),
+            _ => None,
+        };
+        Self::new_with_local_addr(
             default_headers,
             header_keys,
             keyed_quotas,
             default_quota,
             timeout_secs,
             proxy_url,
+            parsed_local_addr,
         )
         .map_err(HttpClientError::into_py_err)
     }
