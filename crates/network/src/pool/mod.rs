@@ -29,6 +29,10 @@ use siphasher::sip::SipHasher13;
 
 use crate::ratelimiter::quota::Quota;
 
+pub mod http_pool;
+
+pub use http_pool::HttpPool;
+
 /// Hint that callers pass into a pool to influence which slot is picked.
 ///
 /// `Stateless` requests can use any slot — round-robin gives the best
@@ -127,7 +131,7 @@ pub struct HttpClientTemplate {
 ///
 /// We are not protecting against hash-collision attacks here (no adversarial
 /// input); the `(0, 0)` key is the conventional "no secret" sentinel for
-/// deterministic SipHash.
+/// deterministic `SipHash`.
 ///
 /// # Panics
 ///
@@ -149,11 +153,11 @@ mod type_tests {
 
     #[test]
     fn pickhint_variants_construct() {
-        let _h1 = PickHint::Stateless;
-        let _h2 = PickHint::WalletPrivateChannel {
+        let _ = PickHint::Stateless;
+        let _ = PickHint::WalletPrivateChannel {
             channel: "userFills",
         };
-        let _h3 = PickHint::MarketDataChannel {
+        let _ = PickHint::MarketDataChannel {
             instrument: "BTC",
             channel: "l2Book@BTC",
         };
@@ -167,12 +171,12 @@ mod type_tests {
 
     #[test]
     fn pool_error_variants_construct() {
-        let _e1 = PoolError::Empty;
-        let _e2 = PoolError::InvalidAddress {
+        let _ = PoolError::Empty;
+        let _ = PoolError::InvalidAddress {
             input: "x".into(),
             reason: "y".into(),
         };
-        let _e3 = PoolError::BindFailed {
+        let _ = PoolError::BindFailed {
             address: IpAddr::V4(Ipv4Addr::LOCALHOST),
             cause: "z".into(),
         };
@@ -180,7 +184,7 @@ mod type_tests {
 
     #[test]
     fn http_client_template_default() {
-        let _t = HttpClientTemplate::default();
+        let _ = HttpClientTemplate::default();
     }
 }
 
