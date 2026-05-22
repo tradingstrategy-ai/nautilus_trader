@@ -959,6 +959,69 @@ impl HyperliquidHttpClient {
         Ok(Self::from_raw(raw_client))
     }
 
+    /// Creates a [`HyperliquidHttpClient`] backed by a multi-IP REST pool.
+    ///
+    /// Mirrors the env-var resolution flow of [`with_credentials`] but routes
+    /// the underlying pool through [`HyperliquidRawHttpClient::with_credentials_and_pool`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Auth`] if credentials are invalid or the pool can't
+    /// be constructed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_credentials_and_pool(
+        private_key: Option<String>,
+        vault_address: Option<String>,
+        account_address: Option<String>,
+        environment: HyperliquidEnvironment,
+        timeout_secs: u64,
+        proxy_url: Option<String>,
+        addresses: Vec<std::net::IpAddr>,
+    ) -> Result<Self> {
+        let (pk_env_var, vault_env_var) =
+            crate::common::credential::credential_env_vars(environment);
+
+        let resolved_pk = match private_key {
+            Some(pk) => Some(pk),
+            None => env::var(pk_env_var).ok(),
+        };
+        let resolved_vault = match vault_address {
+            Some(vault) => Some(vault),
+            None => env::var(vault_env_var).ok(),
+        };
+        let resolved_account_address = match account_address {
+            Some(addr) => Some(addr),
+            None => env::var("HYPERLIQUID_ACCOUNT_ADDRESS").ok(),
+        };
+
+        let pool = HyperliquidRawHttpClient::make_pool_multi(timeout_secs, proxy_url, addresses)
+            .map_err(|e| Error::auth(format!("Failed to build REST pool: {e}")))?;
+
+        let raw_client = match resolved_pk {
+            Some(pk) => HyperliquidRawHttpClient::from_credentials_with_pool(
+                &pk,
+                resolved_vault.as_deref(),
+                environment,
+                pool,
+            )?,
+            None => HyperliquidRawHttpClient::new_with_pool(environment, pool),
+        };
+
+        Ok(Self {
+            inner: Arc::new(raw_client),
+            clock: get_atomic_clock_realtime(),
+            instruments: Arc::new(AtomicMap::new()),
+            instruments_by_coin: Arc::new(AtomicMap::new()),
+            asset_indices: Arc::new(AtomicMap::new()),
+            spot_fill_coins: Arc::new(AtomicMap::new()),
+            client_order_id_cloids: Arc::new(Mutex::new(AHashMap::new())),
+            account_id: None,
+            account_address: resolved_account_address,
+            normalize_prices: true,
+            market_order_slippage_bps: crate::common::parse::DEFAULT_MARKET_SLIPPAGE_BPS,
+        })
+    }
+
     /// Creates a new public [`HyperliquidHttpClient`] backed by a multi-IP
     /// pool with the given source addresses.
     ///
@@ -3298,7 +3361,7 @@ mod tests {
     use serde_json::{Value, json};
     use ustr::Ustr;
 
-    use super::HyperliquidHttpClient;
+    use super::{HyperliquidHttpClient, parse_addr_list};
     use crate::{
         common::{
             consts::HYPERLIQUID_VENUE,
@@ -3776,6 +3839,57 @@ mod tests {
         assert_eq!(resolved.id(), hip3.id());
     }
 
+    // ---------- parse_addr_list ----------
+
+    #[rstest]
+    fn parse_addr_list_none_returns_empty() {
+        assert!(parse_addr_list("test", &None).unwrap().is_empty());
+    }
+
+    #[rstest]
+    fn parse_addr_list_empty_strings_filtered() {
+        let input = Some(vec!["".to_string(), "  ".to_string()]);
+        assert!(parse_addr_list("test", &input).unwrap().is_empty());
+    }
+
+    #[rstest]
+    fn parse_addr_list_parses_valid_ips() {
+        let input = Some(vec!["127.0.0.1".to_string(), "10.0.0.1".to_string()]);
+        let result = parse_addr_list("test", &input).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].to_string(), "127.0.0.1");
+        assert_eq!(result[1].to_string(), "10.0.0.1");
+    }
+
+    #[rstest]
+    fn parse_addr_list_trims_whitespace() {
+        let input = Some(vec![" 127.0.0.1 ".to_string()]);
+        let result = parse_addr_list("test", &input).unwrap();
+        assert_eq!(result[0].to_string(), "127.0.0.1");
+    }
+
+    #[rstest]
+    fn parse_addr_list_rejects_garbage() {
+        let input = Some(vec!["not.an.ip".to_string()]);
+        let err = parse_addr_list("test", &input).unwrap_err();
+        assert!(
+            err.contains("Invalid test entry 'not.an.ip'"),
+            "got: {err}"
+        );
+    }
+
+    #[rstest]
+    fn parse_addr_list_drops_empties_keeps_valid() {
+        let input = Some(vec![
+            "".to_string(),
+            "127.0.0.1".to_string(),
+            "  ".to_string(),
+        ]);
+        let result = parse_addr_list("test", &input).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].to_string(), "127.0.0.1");
+    }
+
     #[rstest]
     fn raw_http_client_new_with_pool_loopback() {
         use std::net::{IpAddr, Ipv4Addr};
@@ -3804,4 +3918,33 @@ mod tests {
         );
         assert!(result.is_err(), "empty pool must fail to construct");
     }
+}
+
+/// Parse a list of IP strings into `Vec<IpAddr>`, returning `Err(String)` on failure.
+///
+/// Pure-Rust helper (no pyo3 dependency) that can be unit-tested without the
+/// `python` feature. The pyo3 wrapper in `python/http.rs` calls this and maps
+/// the `String` error into a `PyErr`.
+///
+/// Empty strings and whitespace-only entries are silently skipped.
+///
+/// # Errors
+///
+/// Returns a `String` error message if any non-empty entry cannot be parsed
+/// as an [`std::net::IpAddr`].
+pub(crate) fn parse_addr_list(
+    field_name: &str,
+    raw: &Option<Vec<String>>,
+) -> std::result::Result<Vec<std::net::IpAddr>, String> {
+    let Some(list) = raw else {
+        return Ok(Vec::new());
+    };
+    list.iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<std::net::IpAddr>()
+                .map_err(|e| format!("Invalid {field_name} entry '{s}': {e}"))
+        })
+        .collect()
 }

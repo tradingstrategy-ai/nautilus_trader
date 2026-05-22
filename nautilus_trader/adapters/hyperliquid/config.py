@@ -48,6 +48,14 @@ class HyperliquidDataClientConfig(LiveDataClientConfig, frozen=True):
     base_url_ws: str | None = None
     proxy_url: str | None = None
     http_timeout_secs: PositiveInt = 10
+    # Multi-IP REST pool: when set, REST traffic round-robins across the
+    # listed source IPs. Each IP must be assigned to a NIC on the host.
+    local_addrs_rest: tuple[str, ...] | None = None
+    # WS multi-IP fields — reserved for a follow-up PR. Currently no-op
+    # but validated at construction time so operators get an early error
+    # on garbage input. ws_shard_by accepts "instrument" or "round_robin".
+    local_addrs_ws: tuple[str, ...] | None = None
+    ws_shard_by: str | None = None
 
 
 class HyperliquidExecClientConfig(LiveExecClientConfig, frozen=True):
@@ -116,3 +124,11 @@ class HyperliquidExecClientConfig(LiveExecClientConfig, frozen=True):
     http_timeout_secs: PositiveInt = 10
     ws_post_timeout_secs: PositiveInt = 10
     normalize_prices: bool = True
+    # Multi-IP REST pool: when set, REST traffic round-robins across the
+    # listed source IPs. Each IP must be assigned to a NIC on the host.
+    local_addrs_rest: tuple[str, ...] | None = None
+    # WS multi-IP fields — reserved for a follow-up PR. Currently no-op
+    # but validated at construction time so operators get an early error
+    # on garbage input. ws_shard_by accepts "instrument" or "round_robin".
+    local_addrs_ws: tuple[str, ...] | None = None
+    ws_shard_by: str | None = None

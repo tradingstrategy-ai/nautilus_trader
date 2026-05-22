@@ -54,6 +54,11 @@ def get_cached_hyperliquid_http_client(
     environment: HyperliquidEnvironment = HyperliquidEnvironment.MAINNET,
     proxy_url: str | None = None,
     normalize_prices: bool = True,
+    # tuple-typed so the params remain hashable for lru_cache; converted
+    # to list before crossing the pyo3 boundary.
+    local_addrs_rest: tuple[str, ...] | None = None,
+    local_addrs_ws: tuple[str, ...] | None = None,
+    ws_shard_by: str | None = None,
 ) -> nautilus_pyo3.HyperliquidHttpClient:
     """
     Cache and return a Hyperliquid HTTP client with the given parameters.
@@ -101,6 +106,15 @@ def get_cached_hyperliquid_http_client(
 
     if timeout_secs is not None:
         kwargs["timeout_secs"] = timeout_secs
+
+    # Multi-IP fields — pyo3 wants list[str], not tuple. Drop when empty
+    # so the pyo3 default (None / kernel-default source IP) kicks in.
+    if local_addrs_rest:
+        kwargs["local_addrs_rest"] = list(local_addrs_rest)
+    if local_addrs_ws:
+        kwargs["local_addrs_ws"] = list(local_addrs_ws)
+    if ws_shard_by:
+        kwargs["ws_shard_by"] = ws_shard_by
 
     return nautilus_pyo3.HyperliquidHttpClient(**kwargs)
 
@@ -188,6 +202,9 @@ class HyperliquidLiveDataClientFactory(LiveDataClientFactory):
             timeout_secs=config.http_timeout_secs,
             environment=environment,
             proxy_url=config.proxy_url,
+            local_addrs_rest=config.local_addrs_rest,
+            local_addrs_ws=config.local_addrs_ws,
+            ws_shard_by=config.ws_shard_by,
         )
         provider = get_cached_hyperliquid_instrument_provider(
             client=client,
@@ -252,6 +269,9 @@ class HyperliquidLiveExecClientFactory(LiveExecClientFactory):
             environment=environment,
             proxy_url=config.proxy_url,
             normalize_prices=config.normalize_prices,
+            local_addrs_rest=config.local_addrs_rest,
+            local_addrs_ws=config.local_addrs_ws,
+            ws_shard_by=config.ws_shard_by,
         )
         provider = get_cached_hyperliquid_instrument_provider(
             client=client,
