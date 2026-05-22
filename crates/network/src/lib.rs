@@ -93,6 +93,7 @@ pub mod dst;
 pub mod http;
 pub mod mode;
 pub mod net;
+pub mod pool;
 pub mod retry;
 pub mod socket;
 pub mod transport;
