@@ -1231,6 +1231,7 @@ async fn test_ws_trading_submit_order_sends_builder_and_cloid() {
         None,
         TransportBackend::default(),
         None,
+        None,
     );
     ws_client.set_post_timeout(Duration::from_secs(1));
     ws_client.connect().await.unwrap();
@@ -1356,6 +1357,7 @@ async fn test_ws_trading_cancel_and_modify_send_expected_actions() {
         HyperliquidEnvironment::Mainnet,
         None,
         TransportBackend::default(),
+        None,
         None,
     );
     ws_client.set_post_timeout(Duration::from_secs(1));
@@ -1531,6 +1533,7 @@ async fn test_ws_cancel_orders_keeps_valid_cancel_when_one_venue_id_is_invalid()
         None,
         TransportBackend::default(),
         None,
+        None,
     );
     ws_client.set_post_timeout(Duration::from_secs(1));
     ws_client.connect().await.unwrap();
@@ -1591,6 +1594,7 @@ async fn test_ws_cancel_orders_keeps_valid_cancel_when_one_asset_index_is_missin
         HyperliquidEnvironment::Mainnet,
         None,
         TransportBackend::default(),
+        None,
         None,
     );
     ws_client.set_post_timeout(Duration::from_secs(1));
@@ -1654,6 +1658,7 @@ async fn test_ws_cancel_orders_returns_err_on_post_failure() {
         None,
         TransportBackend::default(),
         None,
+        None,
     );
     ws_client.set_post_timeout(Duration::from_secs(1));
     ws_client.connect().await.unwrap();
@@ -1697,6 +1702,7 @@ async fn test_ws_cancel_orders_returns_per_item_errors_for_mixed_venue_statuses(
         HyperliquidEnvironment::Mainnet,
         None,
         TransportBackend::default(),
+        None,
         None,
     );
     ws_client.set_post_timeout(Duration::from_secs(1));
@@ -1750,6 +1756,7 @@ async fn test_ws_cancel_orders_returns_err_when_second_route_post_fails() {
         None,
         TransportBackend::default(),
         None,
+        None,
     );
     ws_client.set_post_timeout(Duration::from_secs(1));
     ws_client.connect().await.unwrap();
@@ -1795,6 +1802,7 @@ async fn test_ws_cancel_orders_sends_oid_route_when_cloid_route_is_rejected() {
         HyperliquidEnvironment::Mainnet,
         None,
         TransportBackend::default(),
+        None,
         None,
     );
     ws_client.set_post_timeout(Duration::from_secs(1));
@@ -1864,6 +1872,7 @@ async fn test_ws_cancel_orders_sends_oid_route_when_cloid_status_count_mismatche
         None,
         TransportBackend::default(),
         None,
+        None,
     );
     ws_client.set_post_timeout(Duration::from_secs(1));
     ws_client.connect().await.unwrap();
@@ -1924,6 +1933,7 @@ async fn test_ws_submit_orders_does_not_cache_cloids_when_later_order_fails_conv
         HyperliquidEnvironment::Mainnet,
         None,
         TransportBackend::default(),
+        None,
         None,
     );
     let valid_order = make_limit_order("O-WS-SUBMIT-LIST-OK");

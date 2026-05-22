@@ -141,6 +141,7 @@ impl HyperliquidDataClient {
             None,
             config.transport_backend,
             config.proxy_url.clone(),
+            None,
         );
         let mut stream_health_monitor = MarketDataStreamHealthMonitor::new(
             Duration::from_secs(config.stale_stream_receive_timeout_secs),

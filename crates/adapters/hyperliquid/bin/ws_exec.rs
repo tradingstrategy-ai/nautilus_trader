@@ -45,6 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None,
         TransportBackend::default(),
         None,
+        None,
     );
     client.connect().await?;
     log::info!("Connected to Hyperliquid WebSocket");
