@@ -59,12 +59,12 @@
 //! Hyperliquid uses **mark price** for all trigger evaluations (TP/SL orders).
 
 use anyhow::Context;
-use nautilus_core::UnixNanos;
 pub use nautilus_core::serialization::{
     deserialize_decimal_from_str, deserialize_optional_decimal_from_str,
     deserialize_vec_decimal_from_str, serialize_decimal_as_str, serialize_optional_decimal_as_str,
     serialize_vec_decimal_as_str,
 };
+use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::{bar::BarType, quote::QuoteTick},
     enums::{
@@ -72,7 +72,7 @@ use nautilus_model::{
         TimeInForce,
     },
     identifiers::{ClientOrderId, TradeId},
-    orders::{Order, any::OrderAny},
+    orders::{any::OrderAny, Order},
     types::{AccountBalance, Currency, MarginBalance, Money},
 };
 use rust_decimal::Decimal;
@@ -90,8 +90,8 @@ use crate::{
         HyperliquidExecCancelByCloidRequest, HyperliquidExecCancelStatus, HyperliquidExecGrouping,
         HyperliquidExecLimitParams, HyperliquidExecModifyStatus, HyperliquidExecOrderKind,
         HyperliquidExecOrderStatus, HyperliquidExecPlaceOrderRequest, HyperliquidExecResponseData,
-        HyperliquidExecTif, HyperliquidExecTpSl, HyperliquidExecTriggerParams, RESPONSE_STATUS_OK,
-        SpotClearinghouseState,
+        HyperliquidExecTif, HyperliquidExecTpSl, HyperliquidExecTriggerParams,
+        SpotClearinghouseState, RESPONSE_STATUS_OK,
     },
     websocket::messages::TrailingOffsetType,
 };
@@ -914,10 +914,10 @@ pub fn parse_trigger_price(trigger_px: &str) -> anyhow::Result<Decimal> {
 
 /// Parses Hyperliquid clearinghouse state into Nautilus account balances and margins.
 ///
-/// Uses the same field selection as the HTTP account-state path
-/// (`cross_margin_summary.total_raw_usd` for total, top-level `state.withdrawable`
-/// for free) so the execution adapter and the HTTP client emit consistent balances
-/// for the same clearinghouse snapshot.
+/// Uses `marginSummary.accountValue` when present (vault leader accounts expose
+/// their true NAV there), otherwise falls back to `crossMarginSummary`.
+/// `accountValue` is cash plus open-position MTM and is therefore the account
+/// total Nautilus should emit. Free balance is NAV minus margin used.
 ///
 /// # Errors
 ///
@@ -930,27 +930,24 @@ pub fn parse_account_balances_and_margins(
 
     let currency = Currency::USDC();
 
-    let cross_margin_summary = match &state.cross_margin_summary {
+    let margin_summary = match state
+        .margin_summary
+        .as_ref()
+        .or(state.cross_margin_summary.as_ref())
+    {
         Some(summary) => summary,
         None => return Ok((balances, margins)),
     };
 
-    let mut total_value = cross_margin_summary.total_raw_usd;
-    let free_value = state.withdrawable.unwrap_or(total_value).max(Decimal::ZERO);
-
-    // Withdrawable may include spot balances that sit outside a positive margin
-    // account value; raise total so those funds are not silently clamped away.
-    if total_value >= Decimal::ZERO && free_value > total_value {
-        total_value = free_value;
-    }
+    let total_value = margin_summary.account_value.max(Decimal::ZERO);
+    let margin_used = margin_summary.total_margin_used.max(Decimal::ZERO);
+    let free_value = (total_value - margin_used).max(Decimal::ZERO);
 
     balances.push(AccountBalance::from_total_and_free(
         total_value,
         free_value,
         currency,
     )?);
-
-    let margin_used = cross_margin_summary.total_margin_used;
 
     if margin_used > Decimal::ZERO {
         // Hyperliquid perps use a single-collateral (USDC) cross-margin model, so the
@@ -2047,11 +2044,8 @@ mod tests {
         assert!(wide > tight);
     }
 
-    // Locks in the field-selection invariant; diverging from it would silently
-    // disagree with the HTTP parser whenever `account_value != total_raw_usd`
-    // or the nested and top-level `withdrawable` values differ.
     #[rstest]
-    fn test_parse_account_balances_uses_total_raw_usd_and_top_level_withdrawable() {
+    fn test_parse_account_balances_uses_account_value_and_margin_used() {
         let json = r#"{
             "assetPositions": [],
             "crossMarginSummary": {
@@ -2070,10 +2064,8 @@ mod tests {
 
         assert_eq!(balances.len(), 1);
         let balance = &balances[0];
-        // Total comes from total_raw_usd (100), not account_value (150); free comes
-        // from top-level state.withdrawable (80), not the nested summary.withdrawable (120).
-        assert_eq!(balance.total.as_decimal(), dec!(100));
-        assert_eq!(balance.free.as_decimal(), dec!(80));
+        assert_eq!(balance.total.as_decimal(), dec!(150));
+        assert_eq!(balance.free.as_decimal(), dec!(130));
         assert_eq!(balance.locked.as_decimal(), dec!(20));
 
         assert_eq!(margins.len(), 1);
@@ -2081,50 +2073,41 @@ mod tests {
     }
 
     #[rstest]
-    fn test_parse_account_balances_preserves_negative_total_raw_usd() {
-        let json =
-            include_str!("../../test_data/http_clearinghouse_state_negative_total_raw_usd.json");
+    fn test_parse_account_balances_prefers_margin_summary_for_vault_nav() {
+        let json = r#"{
+            "assetPositions": [],
+            "crossMarginSummary": {
+                "accountValue": "1000000",
+                "totalNtlPos": "0",
+                "totalRawUsd": "1000000",
+                "totalMarginUsed": "0",
+                "withdrawable": "1000000"
+            },
+            "marginSummary": {
+                "accountValue": "12085.14",
+                "totalNtlPos": "540",
+                "totalRawUsd": "11825.14",
+                "totalMarginUsed": "260",
+                "withdrawable": "11565.14"
+            },
+            "withdrawable": "1000000",
+            "time": 1700000000000
+        }"#;
 
         let state: ClearinghouseState = serde_json::from_str(json).unwrap();
         let (balances, margins) = parse_account_balances_and_margins(&state).unwrap();
 
         assert_eq!(balances.len(), 1);
         let balance = &balances[0];
-        assert_eq!(balance.total.as_decimal(), dec!(-22358.938225));
-        assert_eq!(balance.free.as_decimal(), dec!(772.232111));
-        assert_eq!(balance.locked.as_decimal(), dec!(-23131.170336));
-
+        assert_eq!(balance.total.as_decimal(), dec!(12085.14));
+        assert_eq!(balance.free.as_decimal(), dec!(11825.14));
+        assert_eq!(balance.locked.as_decimal(), dec!(260));
         assert_eq!(margins.len(), 1);
-        assert_eq!(margins[0].initial.as_decimal(), dec!(963.798764));
+        assert_eq!(margins[0].initial.as_decimal(), dec!(260));
     }
 
     #[rstest]
-    fn test_parse_account_balances_bumps_positive_total_when_withdrawable_exceeds() {
-        let json = r#"{
-            "assetPositions": [],
-            "crossMarginSummary": {
-                "accountValue": "100",
-                "totalNtlPos": "0",
-                "totalRawUsd": "100",
-                "totalMarginUsed": "0",
-                "withdrawable": "100"
-            },
-            "withdrawable": "150",
-            "time": 1700000000000
-        }"#;
-
-        let state: ClearinghouseState = serde_json::from_str(json).unwrap();
-        let (balances, _) = parse_account_balances_and_margins(&state).unwrap();
-
-        assert_eq!(balances.len(), 1);
-        let balance = &balances[0];
-        assert_eq!(balance.total.as_decimal(), dec!(150));
-        assert_eq!(balance.free.as_decimal(), dec!(150));
-        assert_eq!(balance.locked.as_decimal(), dec!(0));
-    }
-
-    #[rstest]
-    fn test_parse_account_balances_returns_empty_when_no_cross_margin_summary() {
+    fn test_parse_account_balances_returns_empty_when_no_margin_summary() {
         let json = r#"{
             "assetPositions": [],
             "withdrawable": "100",

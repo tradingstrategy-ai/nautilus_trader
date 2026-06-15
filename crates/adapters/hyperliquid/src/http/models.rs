@@ -1991,6 +1991,10 @@ pub struct ClearinghouseState {
     /// Cross margin summary information.
     #[serde(default)]
     pub cross_margin_summary: Option<CrossMarginSummary>,
+    /// Margin summary information. Vault leader responses expose the true NAV
+    /// here; prefer it over `crossMarginSummary` when present.
+    #[serde(default)]
+    pub margin_summary: Option<CrossMarginSummary>,
     /// Withdrawable balance (top-level field).
     #[serde(
         default,
