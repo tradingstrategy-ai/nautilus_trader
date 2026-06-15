@@ -15,7 +15,7 @@
 
 use std::fmt::Display;
 
-use alloy_primitives::{Address, keccak256};
+use alloy_primitives::{keccak256, Address};
 use nautilus_model::identifiers::ClientOrderId;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -1633,6 +1633,10 @@ pub struct ClearinghouseState {
     /// Cross margin summary information.
     #[serde(default)]
     pub cross_margin_summary: Option<CrossMarginSummary>,
+    /// Margin summary information. Vault leader responses expose the true NAV
+    /// here; prefer it over `crossMarginSummary` when present.
+    #[serde(default)]
+    pub margin_summary: Option<CrossMarginSummary>,
     /// Withdrawable balance (top-level field).
     #[serde(
         default,
