@@ -80,11 +80,9 @@ impl HyperliquidHttpClient {
         // entries) → no source-IP binding (kernel default).
         let rest_addrs = resolve_addr_list("local_addrs_rest", &local_addrs_rest)?;
 
-        // local_addrs_ws and ws_shard_by are reserved for a follow-up PR
-        // implementing multi-IP WS pooling. Validate the shapes so operators
-        // get an early error on malformed input, but don't actually wire
-        // anything up yet — the current WS code path uses the single-IP
-        // local_addr field.
+        // Validate the WS pool knobs here because the Python factory passes
+        // one shared config surface through both the HTTP and WS constructors.
+        // The actual WS pool is owned by HyperliquidWebSocketClient.
         if let Some(addrs) = &local_addrs_ws {
             for s in addrs {
                 let s = s.trim();
@@ -94,13 +92,6 @@ impl HyperliquidHttpClient {
                     })?;
                 }
             }
-            if addrs.iter().any(|s| !s.trim().is_empty()) {
-                log::warn!(
-                    "local_addrs_ws is set but WS multi-IP pooling is not yet implemented. \
-                     The WS connection will use the kernel default source IP for now. \
-                     WS pooling is tracked as a follow-up PR."
-                );
-            }
         }
         if let Some(mode) = &ws_shard_by {
             let mode = mode.trim();
@@ -109,7 +100,6 @@ impl HyperliquidHttpClient {
                     "Unknown ws_shard_by '{mode}', expected: instrument, round_robin"
                 )));
             }
-            // Even if valid, ws_shard_by has no effect until WS pooling lands.
         }
 
         let mut client = if rest_addrs.is_empty() {

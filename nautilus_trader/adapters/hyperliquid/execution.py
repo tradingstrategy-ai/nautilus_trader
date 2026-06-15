@@ -148,6 +148,8 @@ class HyperliquidExecutionClient(LiveExecutionClient):
             account_id=str(account_id),
             proxy_url=config.proxy_url,
             local_addr=config.local_addr,
+            local_addrs_ws=list(config.local_addrs_ws) if config.local_addrs_ws else None,
+            ws_shard_by=config.ws_shard_by,
         )
         self._ws_client.set_post_timeout(config.ws_post_timeout_secs)
 

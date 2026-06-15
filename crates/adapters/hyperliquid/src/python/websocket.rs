@@ -30,7 +30,7 @@ use nautilus_model::{
     },
     types::{Price, Quantity},
 };
-use nautilus_network::websocket::TransportBackend;
+use nautilus_network::{pool::ShardMode, websocket::TransportBackend};
 use pyo3::{conversion::IntoPyObjectExt, prelude::*};
 
 use crate::{
@@ -57,13 +57,15 @@ impl HyperliquidWebSocketClient {
     /// Orchestrates WebSocket connection and subscriptions using a command-based architecture,
     /// where the inner FeedHandler owns the WebSocketClient and handles all I/O.
     #[new]
-    #[pyo3(signature = (url=None, environment=HyperliquidEnvironment::Mainnet, account_id=None, proxy_url=None, local_addr=None))]
+    #[pyo3(signature = (url=None, environment=HyperliquidEnvironment::Mainnet, account_id=None, proxy_url=None, local_addr=None, local_addrs_ws=None, ws_shard_by=None))]
     fn py_new(
         url: Option<String>,
         environment: HyperliquidEnvironment,
         account_id: Option<String>,
         proxy_url: Option<String>,
         local_addr: Option<String>,
+        local_addrs_ws: Option<Vec<String>>,
+        ws_shard_by: Option<String>,
     ) -> PyResult<Self> {
         let account_id = account_id.map(|s| AccountId::from(s.as_str()));
         // Parse the optional source-IP literal.  Trimmed-empty resolves to
@@ -78,13 +80,38 @@ impl HyperliquidWebSocketClient {
             ),
             _ => None,
         };
-        Ok(Self::new(
+
+        let mut parsed_local_addrs_ws = Vec::new();
+        if let Some(addrs) = local_addrs_ws {
+            for addr in addrs {
+                let trimmed = addr.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                parsed_local_addrs_ws.push(IpAddr::from_str(trimmed).map_err(|e| {
+                    to_pyvalue_err(format!("Invalid local_addrs_ws entry '{addr}': {e}"))
+                })?);
+            }
+        }
+        let shard_mode = match ws_shard_by.as_deref() {
+            None | Some("") | Some("instrument") => ShardMode::Instrument,
+            Some("round_robin") => ShardMode::RoundRobin,
+            Some(mode) => {
+                return Err(to_pyvalue_err(format!(
+                    "Unknown ws_shard_by '{mode}', expected: instrument, round_robin"
+                )));
+            }
+        };
+
+        Ok(Self::new_with_ws_pool(
             url,
             environment,
             account_id,
             TransportBackend::default(),
             proxy_url,
             parsed_local_addr,
+            parsed_local_addrs_ws,
+            shard_mode,
         ))
     }
 

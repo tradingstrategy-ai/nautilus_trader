@@ -167,6 +167,7 @@ impl HttpClient {
             client,
             header_keys: Arc::new(valid_keys),
             header_names: Arc::new(header_names),
+            local_addr,
         };
 
         let keyed_quotas = keyed_quotas
@@ -361,6 +362,7 @@ pub struct InnerHttpClient {
     pub(crate) client: reqwest::Client,
     pub(crate) header_keys: Arc<Vec<String>>,
     pub(crate) header_names: Arc<Vec<HeaderName>>,
+    pub(crate) local_addr: Option<IpAddr>,
 }
 
 impl InnerHttpClient {
@@ -464,13 +466,23 @@ impl InnerHttpClient {
             None => request_builder.build().map_err(HttpClientError::from)?,
         };
 
-        log::trace!("{} {}", request.method(), request.url());
+        log::trace!(
+            "{} {} local_addr={:?}",
+            request.method(),
+            request.url(),
+            self.local_addr
+        );
 
         let response = self
             .client
             .execute(request)
             .await
             .map_err(HttpClientError::from)?;
+        log::trace!(
+            "HTTP response status={} local_addr={:?}",
+            response.status(),
+            self.local_addr
+        );
 
         self.to_response(response).await
     }
@@ -519,6 +531,7 @@ impl Default for InnerHttpClient {
             client,
             header_keys: Arc::default(),
             header_names: Arc::default(),
+            local_addr: None,
         }
     }
 }
@@ -889,15 +902,8 @@ mod tests {
     fn test_http_client_with_local_addr_none_matches_default() {
         // `new_with_local_addr(..., None)` should behave identically to `new(...)`.
         let a = HttpClient::new(HashMap::new(), vec![], vec![], None, None, None);
-        let b = HttpClient::new_with_local_addr(
-            HashMap::new(),
-            vec![],
-            vec![],
-            None,
-            None,
-            None,
-            None,
-        );
+        let b =
+            HttpClient::new_with_local_addr(HashMap::new(), vec![], vec![], None, None, None, None);
         assert!(a.is_ok());
         assert!(b.is_ok());
     }
