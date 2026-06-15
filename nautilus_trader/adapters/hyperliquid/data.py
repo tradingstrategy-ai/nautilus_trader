@@ -444,6 +444,8 @@ class HyperliquidDataClient(LiveMarketDataClient):
             environment=environment,
             proxy_url=config.proxy_url,
             local_addr=config.local_addr,
+            local_addrs_ws=list(config.local_addrs_ws) if config.local_addrs_ws else None,
+            ws_shard_by=config.ws_shard_by,
         )
         self._all_dexs_asset_ctxs_bootstrapped = False
 

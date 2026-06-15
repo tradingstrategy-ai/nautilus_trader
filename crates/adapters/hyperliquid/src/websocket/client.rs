@@ -14,10 +14,11 @@
 // -------------------------------------------------------------------------------------------------
 
 use std::{
+    net::IpAddr,
     str::FromStr,
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        Arc, Mutex, RwLock,
+        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -42,6 +43,7 @@ use nautilus_model::{
 };
 use nautilus_network::{
     mode::ConnectionMode,
+    pool::{ShardMode, slot_for_instrument},
     websocket::{
         AuthTracker, SubscriptionState, TransportBackend, WebSocketClient, WebSocketConfig,
         channel_message_handler,
@@ -78,7 +80,7 @@ use crate::{
     websocket::{
         book::{BookStreamOptions, BookStreamRegistry, BookStreamRelease, BookStreamUse},
         enums::HyperliquidWsChannel,
-        handler::{FeedHandler, HandlerCommand},
+        handler::{FeedHandler, HandlerCommand, subscription_to_key},
         messages::{
             NautilusWsMessage, PostRequest, PostResponse, PostResponsePayload, SubscriptionRequest,
         },
@@ -95,6 +97,8 @@ pub(super) const CLOID_CACHE_CAPACITY: usize = 10_000;
 
 /// Shared cloid -> `ClientOrderId` cache used by the WS handler.
 pub(super) type CloidCache = Arc<Mutex<FifoCacheMap<Ustr, ClientOrderId, CLOID_CACHE_CAPACITY>>>;
+
+type CommandSender = tokio::sync::mpsc::UnboundedSender<HandlerCommand>;
 
 /// Represents the different data types available from asset context subscriptions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -125,7 +129,10 @@ pub struct HyperliquidWebSocketClient {
     url: String,
     connection_mode: Arc<ArcSwap<AtomicU8>>,
     signal: Arc<AtomicBool>,
-    cmd_tx: Arc<tokio::sync::RwLock<tokio::sync::mpsc::UnboundedSender<HandlerCommand>>>,
+    cmd_tx: Arc<tokio::sync::RwLock<CommandSender>>,
+    cmd_txs: Arc<RwLock<Vec<CommandSender>>>,
+    slot_subscriptions: Arc<RwLock<Vec<SubscriptionState>>>,
+    subscription_slots: Arc<DashMap<String, usize>>,
     out_rx: Option<tokio::sync::mpsc::UnboundedReceiver<NautilusWsMessage>>,
     auth_tracker: AuthTracker,
     subscriptions: SubscriptionState,
@@ -143,6 +150,7 @@ pub struct HyperliquidWebSocketClient {
     post_limiter: Arc<WeightedLimiter>,
     post_timeout: Duration,
     task_handle: Option<tokio::task::JoinHandle<()>>,
+    task_handles: Vec<tokio::task::JoinHandle<()>>,
     account_id: Option<AccountId>,
     transport_backend: TransportBackend,
     proxy_url: Option<String>,
@@ -155,7 +163,13 @@ pub struct HyperliquidWebSocketClient {
     /// to pin REST + WS traffic to a known source IP at the application
     /// layer.  When `None`, the kernel selects the source IP from the
     /// routing table.
-    local_addr: Option<std::net::IpAddr>,
+    local_addr: Option<IpAddr>,
+    /// Optional source-IP pool for WS sockets. Slot 0 is reserved for wallet-private
+    /// channels and WS post trading actions. Public market-data subscriptions are
+    /// sharded across all slots.
+    local_addrs_ws: Vec<IpAddr>,
+    ws_shard_by: ShardMode,
+    ws_rr_counter: Arc<AtomicUsize>,
 }
 
 impl Clone for HyperliquidWebSocketClient {
@@ -165,6 +179,9 @@ impl Clone for HyperliquidWebSocketClient {
             connection_mode: Arc::clone(&self.connection_mode),
             signal: Arc::clone(&self.signal),
             cmd_tx: Arc::clone(&self.cmd_tx),
+            cmd_txs: Arc::clone(&self.cmd_txs),
+            slot_subscriptions: Arc::clone(&self.slot_subscriptions),
+            subscription_slots: Arc::clone(&self.subscription_slots),
             out_rx: None,
             auth_tracker: self.auth_tracker.clone(),
             subscriptions: self.subscriptions.clone(),
@@ -182,11 +199,14 @@ impl Clone for HyperliquidWebSocketClient {
             post_limiter: Arc::clone(&self.post_limiter),
             post_timeout: self.post_timeout,
             task_handle: None,
+            task_handles: Vec::new(),
             account_id: self.account_id,
             transport_backend: self.transport_backend,
             proxy_url: self.proxy_url.clone(),
             local_addr: self.local_addr,
-        }
+            local_addrs_ws: self.local_addrs_ws.clone(),
+            ws_shard_by: self.ws_shard_by,
+            ws_rr_counter: Arc::clone(&self.ws_rr_counter),
     }
 }
 
@@ -204,7 +224,31 @@ impl HyperliquidWebSocketClient {
         account_id: Option<AccountId>,
         transport_backend: TransportBackend,
         proxy_url: Option<String>,
-        local_addr: Option<std::net::IpAddr>,
+        local_addr: Option<IpAddr>,
+    ) -> Self {
+        Self::new_with_ws_pool(
+            url,
+            environment,
+            account_id,
+            transport_backend,
+            proxy_url,
+            local_addr,
+            Vec::new(),
+            ShardMode::Instrument,
+        )
+    }
+
+    /// Creates a new Hyperliquid WebSocket client with optional multi-IP WS pooling.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_ws_pool(
+        url: Option<String>,
+        environment: HyperliquidEnvironment,
+        account_id: Option<AccountId>,
+        transport_backend: TransportBackend,
+        proxy_url: Option<String>,
+        local_addr: Option<IpAddr>,
+        local_addrs_ws: Vec<IpAddr>,
+        ws_shard_by: ShardMode,
     ) -> Self {
         let url = url.unwrap_or_else(|| ws_url(environment).to_string());
         let connection_mode = Arc::new(ArcSwap::new(Arc::new(AtomicU8::new(
@@ -234,12 +278,19 @@ impl HyperliquidWebSocketClient {
                 let (tx, _) = tokio::sync::mpsc::unbounded_channel();
                 Arc::new(tokio::sync::RwLock::new(tx))
             },
+            cmd_txs: Arc::new(RwLock::new(Vec::new())),
+            slot_subscriptions: Arc::new(RwLock::new(Vec::new())),
+            subscription_slots: Arc::new(DashMap::new()),
             out_rx: None,
             task_handle: None,
+            task_handles: Vec::new(),
             account_id,
             transport_backend,
             proxy_url,
             local_addr,
+            local_addrs_ws,
+            ws_shard_by,
+            ws_rr_counter: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -254,59 +305,15 @@ impl HyperliquidWebSocketClient {
         // entries must not gate the venue subscribe for re-subscriptions
         self.book_streams.clear();
 
-        let (message_handler, raw_rx) = channel_message_handler();
-        let cfg = WebSocketConfig {
-            url: self.url.clone(),
-            headers: vec![],
-            heartbeat: Some(30),
-            heartbeat_msg: Some(HYPERLIQUID_HEARTBEAT_MSG.to_string()),
-            reconnect_timeout_ms: Some(15_000),
-            reconnect_delay_initial_ms: Some(250),
-            reconnect_delay_max_ms: Some(5_000),
-            reconnect_backoff_factor: Some(2.0),
-            reconnect_jitter_ms: Some(200),
-            reconnect_max_attempts: None,
-            idle_timeout_ms: None,
-            backend: self.transport_backend,
-            proxy_url: self.proxy_url.clone(),
-            local_addr: self.local_addr,
-        };
-        let client =
-            WebSocketClient::connect(cfg, Some(message_handler), None, None, vec![], None).await?;
-
-        // Create channels for handler communication
-        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
         let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<NautilusWsMessage>();
-
-        // Update cmd_tx before connection_mode to avoid race where is_active() returns
-        // true but subscriptions still go to the old placeholder channel
-        *self.cmd_tx.write().await = cmd_tx.clone();
         self.out_rx = Some(out_rx);
-
-        self.connection_mode.store(client.connection_mode_atomic());
-        log::debug!("Hyperliquid WebSocket connected: {}", self.url);
-
-        // Send SetClient command immediately
-        if let Err(e) = cmd_tx.send(HandlerCommand::SetClient(client)) {
-            anyhow::bail!("Failed to send SetClient command: {e}");
-        }
-
-        // Initialize handler with existing instruments
+        let local_addrs = self.resolved_ws_local_addrs();
+        let mut cmd_txs: Vec<CommandSender> = Vec::with_capacity(local_addrs.len());
+        let mut slot_subscriptions = Vec::with_capacity(local_addrs.len());
+        let mut task_handles: Vec<tokio::task::JoinHandle<()>> =
+            Vec::with_capacity(local_addrs.len());
         let instruments_vec: Vec<InstrumentAny> =
             self.instruments.load().values().cloned().collect();
-
-        if !instruments_vec.is_empty()
-            && let Err(e) = cmd_tx.send(HandlerCommand::InitializeInstruments(instruments_vec))
-        {
-            log::error!("Failed to send InitializeInstruments: {e}");
-        }
-
-        for (coin, uses) in self.trade_streams.snapshot() {
-            if let Err(e) = cmd_tx.send(HandlerCommand::UpdateTradeSubs { coin, uses }) {
-                log::error!("Failed to send UpdateTradeSubs: {e}");
-            }
-        }
-
         let all_dex_asset_ctxs_instrument_ids = self
             .all_dex_asset_ctxs_instrument_ids
             .load()
@@ -314,105 +321,192 @@ impl HyperliquidWebSocketClient {
             .map(|(dex, instrument_ids)| (*dex, instrument_ids.clone()))
             .collect();
 
-        if let Err(e) = cmd_tx.send(HandlerCommand::CacheAllDexAssetCtxsInstrumentIds(
-            all_dex_asset_ctxs_instrument_ids,
-        )) {
-            log::error!("Failed to send CacheAllDexAssetCtxsInstrumentIds: {e}");
-        }
-
-        // Spawn handler task
-        let signal = Arc::clone(&self.signal);
-        let account_id = self.account_id;
-        let subscriptions = self.subscriptions.clone();
-        let book_streams = self.book_streams.clone();
-        let cmd_tx_for_reconnect = cmd_tx.clone();
-        let cloid_cache = Arc::clone(&self.cloid_cache);
-        let post_router = Arc::clone(&self.post_router);
-
-        let stream_handle = get_runtime().spawn(async move {
-            let mut handler = FeedHandler::new(
-                signal,
-                cmd_rx,
-                raw_rx,
-                out_tx,
-                account_id,
-                subscriptions.clone(),
-                cloid_cache,
-                post_router,
-            );
-
-            let resubscribe_all = || {
-                let topics = subscriptions.all_topics();
-                if topics.is_empty() {
-                    log::debug!("No active subscriptions to restore after reconnection");
-                    return;
-                }
-
-                log::info!(
-                    "Resubscribing to {} active subscriptions after reconnection",
-                    topics.len()
-                );
-
-                for topic in topics {
-                    match subscription_from_topic(&topic) {
-                        Ok(mut subscription) => {
-                            // Topic text cannot carry l2Book precision options;
-                            // replay the shape the stream was opened with
-                            if let SubscriptionRequest::L2Book {
-                                coin,
-                                n_sig_figs,
-                                mantissa,
-                            } = &mut subscription
-                                && let Some(options) = book_streams.options(coin)
-                            {
-                                *n_sig_figs = options.n_sig_figs;
-                                *mantissa = options.mantissa;
-                            }
-
-                            if let Err(e) = cmd_tx_for_reconnect.send(HandlerCommand::Subscribe {
-                                subscriptions: vec![subscription],
-                            }) {
-                                log::error!("Failed to send resubscribe command: {e}");
-                            }
-                        }
-                        Err(e) => {
-                            log::error!(
-                                "Failed to reconstruct subscription from topic: topic={topic}, {e}"
-                            );
-                        }
+        for (slot, local_addr) in local_addrs.into_iter().enumerate() {
+            let (message_handler, raw_rx) = channel_message_handler();
+            let cfg = WebSocketConfig {
+                url: self.url.clone(),
+                headers: vec![],
+                heartbeat: Some(30),
+                heartbeat_msg: Some(HYPERLIQUID_HEARTBEAT_MSG.to_string()),
+                reconnect_timeout_ms: Some(15_000),
+                reconnect_delay_initial_ms: Some(250),
+                reconnect_delay_max_ms: Some(5_000),
+                reconnect_backoff_factor: Some(2.0),
+                reconnect_jitter_ms: Some(200),
+                reconnect_max_attempts: None,
+                idle_timeout_ms: None,
+                backend: self.transport_backend,
+                proxy_url: self.proxy_url.clone(),
+                local_addr,
+            };
+            let client = match WebSocketClient::connect(
+                cfg,
+                Some(message_handler),
+                None,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            {
+                Ok(client) => client,
+                Err(e) => {
+                    for cmd_tx in &cmd_txs {
+                        let _ = cmd_tx.send(HandlerCommand::Disconnect);
                     }
+                    for handle in task_handles {
+                        handle.abort();
+                    }
+                    return Err(e).context(format!(
+                        "failed to connect Hyperliquid WebSocket slot {slot}"
+                    ));
                 }
             };
 
-            loop {
-                match handler.next().await {
-                    Some(NautilusWsMessage::Reconnected) => {
-                        log::info!("WebSocket reconnected");
-                        resubscribe_all();
-                    }
-                    Some(msg) => {
-                        if handler.send(msg).is_err() {
-                            if handler.is_stopped() {
-                                log::debug!("Failed to send message (receiver dropped)");
-                            } else {
-                                log::error!("Failed to send message (receiver dropped)");
-                            }
-                            break;
-                        }
-                    }
-                    None => {
-                        if handler.is_stopped() {
-                            log::debug!("Stop signal received, ending message processing");
-                            break;
-                        }
-                        log::warn!("WebSocket stream ended unexpectedly");
-                        break;
-                    }
+            let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
+            if slot == 0 {
+                // Update slot 0 before marking active so posts/private subscriptions
+                // cannot race into the old placeholder channel.
+                *self.cmd_tx.write().await = cmd_tx.clone();
+                self.connection_mode.store(client.connection_mode_atomic());
+            }
+
+            log::info!(
+                "Hyperliquid WebSocket connected: url={} slot={} local_addr={:?}",
+                self.url,
+                slot,
+                local_addr
+            );
+
+            if let Err(e) = cmd_tx.send(HandlerCommand::SetClient(client)) {
+                anyhow::bail!("Failed to send SetClient command for slot {slot}: {e}");
+            }
+            if !instruments_vec.is_empty()
+                && let Err(e) = cmd_tx.send(HandlerCommand::InitializeInstruments(
+                    instruments_vec.clone(),
+                ))
+            {
+                log::error!("Failed to send InitializeInstruments to slot {slot}: {e}");
+            }
+            for (coin, uses) in self.trade_streams.snapshot() {
+                if let Err(e) = cmd_tx.send(HandlerCommand::UpdateTradeSubs { coin, uses }) {
+                    log::error!("Failed to send UpdateTradeSubs to slot {slot}: {e}");
                 }
             }
-            log::debug!("Handler task completed");
-        });
-        self.task_handle = Some(stream_handle);
+            if let Err(e) = cmd_tx.send(HandlerCommand::CacheAllDexAssetCtxsInstrumentIds(
+                all_dex_asset_ctxs_instrument_ids.clone(),
+            )) {
+                log::error!(
+                    "Failed to send CacheAllDexAssetCtxsInstrumentIds to slot {slot}: {e}"
+                );
+            }
+
+            let signal = Arc::clone(&self.signal);
+            let account_id = self.account_id;
+            let subscriptions = SubscriptionState::new(':');
+            let subscriptions_for_handler = subscriptions.clone();
+            let book_streams = self.book_streams.clone();
+            let cmd_tx_for_reconnect = cmd_tx.clone();
+            let cloid_cache = Arc::clone(&self.cloid_cache);
+            let post_router = Arc::clone(&self.post_router);
+            let out_tx = out_tx.clone();
+
+            let stream_handle = get_runtime().spawn(async move {
+                let mut handler = FeedHandler::new(
+                    signal,
+                    cmd_rx,
+                    raw_rx,
+                    out_tx,
+                    account_id,
+                    subscriptions_for_handler.clone(),
+                    cloid_cache,
+                    post_router,
+                );
+
+                let resubscribe_all = || {
+                    let topics = subscriptions_for_handler.all_topics();
+                    if topics.is_empty() {
+                        log::debug!(
+                            "No active subscriptions to restore after reconnection on slot {slot}"
+                        );
+                        return;
+                    }
+                    log::info!(
+                        "Resubscribing to {} active subscriptions after reconnection on slot {}",
+                        topics.len(),
+                        slot
+                    );
+                    for topic in topics {
+                        match subscription_from_topic(&topic) {
+                            Ok(mut subscription) => {
+                                if let SubscriptionRequest::L2Book {
+                                    coin,
+                                    n_sig_figs,
+                                    mantissa,
+                                } = &mut subscription
+                                    && let Some(options) = book_streams.options(coin)
+                                {
+                                    *n_sig_figs = options.n_sig_figs;
+                                    *mantissa = options.mantissa;
+                                }
+                                if let Err(e) =
+                                    cmd_tx_for_reconnect.send(HandlerCommand::Subscribe {
+                                        subscriptions: vec![subscription],
+                                    })
+                                {
+                                    log::error!(
+                                        "Failed to send resubscribe command on slot {slot}: {e}"
+                                    );
+                                }
+                            }
+                            Err(e) => log::error!(
+                                "Failed to reconstruct subscription from topic on slot {slot}: topic={topic}, {e}"
+                            ),
+                        }
+                    }
+                };
+
+                loop {
+                    match handler.next().await {
+                        Some(NautilusWsMessage::Reconnected) => {
+                            log::info!("WebSocket reconnected on slot {slot}");
+                            resubscribe_all();
+                        }
+                        Some(msg) => {
+                            if handler.send(msg).is_err() {
+                                if handler.is_stopped() {
+                                    log::debug!("Failed to send message (receiver dropped)");
+                                } else {
+                                    log::error!("Failed to send message (receiver dropped)");
+                                }
+                                break;
+                            }
+                        }
+                        None => {
+                            if handler.is_stopped() {
+                                log::debug!("Stop signal received, ending message processing");
+                                break;
+                            }
+                            log::warn!("WebSocket stream ended unexpectedly on slot {slot}");
+                            break;
+                        }
+                    }
+                }
+                log::debug!("Handler task completed on slot {slot}");
+            });
+
+            cmd_txs.push(cmd_tx);
+            slot_subscriptions.push(subscriptions);
+            task_handles.push(stream_handle);
+        }
+
+        self.subscriptions = slot_subscriptions
+            .first()
+            .cloned()
+            .unwrap_or_else(|| SubscriptionState::new(':'));
+        *self.cmd_txs.write().expect(MUTEX_POISONED) = cmd_txs;
+        *self.slot_subscriptions.write().expect(MUTEX_POISONED) = slot_subscriptions;
+        self.task_handles = task_handles;
         Ok(())
     }
 
@@ -430,6 +524,97 @@ impl HyperliquidWebSocketClient {
         self.post_timeout = timeout;
     }
 
+    fn resolved_ws_local_addrs(&self) -> Vec<Option<IpAddr>> {
+        if self.local_addrs_ws.is_empty() {
+            vec![self.local_addr]
+        } else {
+            self.local_addrs_ws.iter().copied().map(Some).collect()
+        }
+    }
+
+    fn slot_count(&self) -> usize {
+        self.cmd_txs.read().expect(MUTEX_POISONED).len().max(1)
+    }
+
+    fn slot_for_market_coin(&self, coin: Ustr) -> usize {
+        let slot_count = self.slot_count();
+        if slot_count == 1 {
+            return 0;
+        }
+
+        match self.ws_shard_by {
+            ShardMode::Instrument => slot_for_instrument(coin.as_str(), slot_count),
+            ShardMode::RoundRobin => {
+                self.ws_rr_counter.fetch_add(1, Ordering::Relaxed) % slot_count
+            }
+        }
+    }
+
+    fn slot_for_subscription(&self, subscription: &SubscriptionRequest) -> usize {
+        match subscription_coin(subscription) {
+            Some(coin) => self.slot_for_market_coin(coin),
+            None => 0,
+        }
+    }
+
+    async fn cmd_tx_for_slot(&self, slot: usize) -> anyhow::Result<CommandSender> {
+        let cmd_tx = {
+            let cmd_txs = self.cmd_txs.read().expect(MUTEX_POISONED);
+            cmd_txs.get(slot).cloned()
+        };
+        if let Some(cmd_tx) = cmd_tx {
+            return Ok(cmd_tx);
+        }
+        if slot == 0 {
+            return Ok(self.cmd_tx.read().await.clone());
+        }
+        anyhow::bail!("WebSocket command slot {slot} is not connected");
+    }
+
+    async fn send_to_slot(&self, slot: usize, command: HandlerCommand) -> anyhow::Result<()> {
+        self.cmd_tx_for_slot(slot)
+            .await?
+            .send(command)
+            .map_err(|e| anyhow::anyhow!("Failed to send WebSocket command to slot {slot}: {e}"))
+    }
+
+    async fn subscribe_on_slot(
+        &self,
+        slot: usize,
+        subscription: SubscriptionRequest,
+    ) -> anyhow::Result<()> {
+        let topic = subscription_to_key(&subscription);
+        self.subscription_slots.insert(topic, slot);
+        self.send_to_slot(
+            slot,
+            HandlerCommand::Subscribe {
+                subscriptions: vec![subscription],
+            },
+        )
+        .await
+    }
+
+    async fn unsubscribe_on_owner_slot(
+        &self,
+        subscription: SubscriptionRequest,
+    ) -> anyhow::Result<()> {
+        let topic = subscription_to_key(&subscription);
+        let slot = self
+            .subscription_slots
+            .get(&topic)
+            .map(|entry| *entry.value())
+            .unwrap_or_else(|| self.slot_for_subscription(&subscription));
+        self.send_to_slot(
+            slot,
+            HandlerCommand::Unsubscribe {
+                subscriptions: vec![subscription],
+            },
+        )
+        .await?;
+        self.subscription_slots.remove(&topic);
+        Ok(())
+    }
+
     /// Force-close fallback for the sync `stop()` path.
     /// Prefer `disconnect()` for graceful shutdown.
     pub(crate) fn abort(&mut self) {
@@ -438,6 +623,9 @@ impl HyperliquidWebSocketClient {
             .store(Arc::new(AtomicU8::new(ConnectionMode::Closed as u8)));
 
         if let Some(handle) = self.task_handle.take() {
+            handle.abort();
+        }
+        for handle in self.task_handles.drain(..) {
             handle.abort();
         }
     }
@@ -469,10 +657,21 @@ impl HyperliquidWebSocketClient {
         log::debug!("Disconnecting Hyperliquid WebSocket");
         self.signal.store(true, Ordering::Relaxed);
 
-        if let Err(e) = self.cmd_tx.read().await.send(HandlerCommand::Disconnect) {
-            log::debug!(
-                "Failed to send disconnect command (handler may already be shut down): {e}"
-            );
+        let cmd_txs = self.cmd_txs.read().expect(MUTEX_POISONED).clone();
+        if cmd_txs.is_empty() {
+            if let Err(e) = self.cmd_tx.read().await.send(HandlerCommand::Disconnect) {
+                log::debug!(
+                    "Failed to send disconnect command (handler may already be shut down): {e}"
+                );
+            }
+        } else {
+            for (slot, cmd_tx) in cmd_txs.into_iter().enumerate() {
+                if let Err(e) = cmd_tx.send(HandlerCommand::Disconnect) {
+                    log::debug!(
+                        "Failed to send disconnect command to slot {slot} (handler may already be shut down): {e}"
+                    );
+                }
+            }
         }
 
         if let Some(handle) = self.task_handle.take() {
@@ -496,6 +695,29 @@ impl HyperliquidWebSocketClient {
         } else {
             log::debug!("No task handle to await");
         }
+        for handle in self.task_handles.drain(..) {
+            log::debug!("Waiting for pooled task handle to complete");
+            let abort_handle = handle.abort_handle();
+            tokio::select! {
+                result = handle => {
+                    match result {
+                        Ok(()) => log::debug!("Pooled task handle completed successfully"),
+                        Err(e) if e.is_cancelled() => log::debug!("Pooled task was cancelled"),
+                        Err(e) => log::error!("Pooled task handle encountered an error: {e:?}"),
+                    }
+                }
+                () = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {
+                    log::warn!("Timeout waiting for pooled task handle, aborting task");
+                    abort_handle.abort();
+                }
+            }
+        }
+        self.cmd_txs.write().expect(MUTEX_POISONED).clear();
+        self.slot_subscriptions
+            .write()
+            .expect(MUTEX_POISONED)
+            .clear();
+        self.subscription_slots.clear();
         log::debug!("Disconnected");
         Ok(())
     }
@@ -1028,11 +1250,15 @@ impl HyperliquidWebSocketClient {
         match tokio::time::timeout(timeout, async {
             let rx = self.post_router.register(id).await?;
 
-            let send_result = self
-                .cmd_tx
-                .read()
-                .await
-                .send(HandlerCommand::Post { id, request });
+            let send_result = match self.cmd_tx_for_slot(0).await {
+                Ok(cmd_tx) => cmd_tx.send(HandlerCommand::Post { id, request }),
+                Err(e) => {
+                    self.post_router.cancel(id).await;
+                    return Err(HyperliquidError::transport(format!(
+                        "post command slot unavailable: {e}"
+                    )));
+                }
+            };
 
             if let Err(e) = send_result {
                 self.post_router.cancel(id).await;
@@ -1089,10 +1315,17 @@ impl HyperliquidWebSocketClient {
         let coin = instrument.raw_symbol().inner();
         self.instruments.insert(coin, instrument.clone());
 
-        // Before connect() the handler isn't running; this send will fail and that's expected
-        // because connect() replays the instruments via InitializeInstruments
-        if let Ok(cmd_tx) = self.cmd_tx.try_read() {
-            let _ = cmd_tx.send(HandlerCommand::UpdateInstrument(instrument));
+        let cmd_txs = self.cmd_txs.read().expect(MUTEX_POISONED).clone();
+        if cmd_txs.is_empty() {
+            // Before connect() the handler isn't running; this send will fail and that's expected
+            // because connect() replays the instruments via InitializeInstruments
+            if let Ok(cmd_tx) = self.cmd_tx.try_read() {
+                let _ = cmd_tx.send(HandlerCommand::UpdateInstrument(instrument));
+            }
+        } else {
+            for cmd_tx in cmd_txs {
+                let _ = cmd_tx.send(HandlerCommand::UpdateInstrument(instrument.clone()));
+            }
         }
     }
 
@@ -1108,7 +1341,10 @@ impl HyperliquidWebSocketClient {
     /// while instruments are identified by full symbols (e.g., `HYPE-USDC-SPOT`).
     /// This mapping allows the handler to look up instruments from spot fills.
     pub fn cache_spot_fill_coins(&self, mapping: AHashMap<Ustr, Ustr>) {
-        if let Ok(cmd_tx) = self.cmd_tx.try_read() {
+        let cmd_tx = self.cmd_txs.read().expect(MUTEX_POISONED).first().cloned();
+        if let Some(cmd_tx) = cmd_tx {
+            let _ = cmd_tx.send(HandlerCommand::CacheSpotFillCoins(mapping));
+        } else if let Ok(cmd_tx) = self.cmd_tx.try_read() {
             let _ = cmd_tx.send(HandlerCommand::CacheSpotFillCoins(mapping));
         }
     }
@@ -1213,7 +1449,12 @@ impl HyperliquidWebSocketClient {
 
     /// Returns the count of confirmed subscriptions.
     pub fn subscription_count(&self) -> usize {
-        self.subscriptions.len()
+        let slot_subscriptions = self.slot_subscriptions.read().expect(MUTEX_POISONED);
+        if slot_subscriptions.is_empty() {
+            self.subscriptions.len()
+        } else {
+            slot_subscriptions.iter().map(SubscriptionState::len).sum()
+        }
     }
 
     /// Gets a bar type from the cache by coin and interval.
@@ -1248,14 +1489,14 @@ impl HyperliquidWebSocketClient {
             .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
         let coin = instrument.raw_symbol().inner();
 
-        let cmd_tx = self.cmd_tx.read().await;
+        let slot = self.slot_for_market_coin(coin);
 
         // Update the handler's coin→instrument mapping for this subscription
-        cmd_tx
-            .send(HandlerCommand::UpdateInstrument(instrument.clone()))
-            .map_err(|e| anyhow::anyhow!("Failed to send UpdateInstrument command: {e}"))?;
+        self.send_to_slot(slot, HandlerCommand::UpdateInstrument(instrument.clone()))
+            .await?;
 
-        self.send_book_stream_subscribe(&cmd_tx, coin, BookStreamUse::Deltas, n_sig_figs, mantissa)
+        self.send_book_stream_subscribe(slot, coin, BookStreamUse::Deltas, n_sig_figs, mantissa)
+            .await
     }
 
     /// Subscribe to order book depth-10 snapshots.
@@ -1285,20 +1526,22 @@ impl HyperliquidWebSocketClient {
             .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
         let coin = instrument.raw_symbol().inner();
 
-        let cmd_tx = self.cmd_tx.read().await;
+        let slot = self.slot_for_market_coin(coin);
 
-        cmd_tx
-            .send(HandlerCommand::UpdateInstrument(instrument.clone()))
-            .map_err(|e| anyhow::anyhow!("Failed to send UpdateInstrument command: {e}"))?;
+        self.send_to_slot(slot, HandlerCommand::UpdateInstrument(instrument.clone()))
+            .await?;
 
-        cmd_tx
-            .send(HandlerCommand::SetDepth10Sub {
+        self.send_to_slot(
+            slot,
+            HandlerCommand::SetDepth10Sub {
                 coin,
                 subscribed: true,
-            })
-            .map_err(|e| anyhow::anyhow!("Failed to send SetDepth10Sub command: {e}"))?;
+            },
+        )
+        .await?;
 
-        self.send_book_stream_subscribe(&cmd_tx, coin, BookStreamUse::Depth10, n_sig_figs, mantissa)
+        self.send_book_stream_subscribe(slot, coin, BookStreamUse::Depth10, n_sig_figs, mantissa)
+            .await
     }
 
     /// Unsubscribe from order book depth-10 snapshots.
@@ -1314,16 +1557,28 @@ impl HyperliquidWebSocketClient {
             .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
         let coin = instrument.raw_symbol().inner();
 
-        let cmd_tx = self.cmd_tx.read().await;
-
-        cmd_tx
-            .send(HandlerCommand::SetDepth10Sub {
+        let subscription = SubscriptionRequest::L2Book {
+            coin,
+            mantissa: None,
+            n_sig_figs: None,
+        };
+        let topic = subscription_to_key(&subscription);
+        let slot = self
+            .subscription_slots
+            .get(&topic)
+            .map(|entry| *entry.value())
+            .unwrap_or_else(|| self.slot_for_market_coin(coin));
+        self.send_to_slot(
+            slot,
+            HandlerCommand::SetDepth10Sub {
                 coin,
                 subscribed: false,
-            })
-            .map_err(|e| anyhow::anyhow!("Failed to send SetDepth10Sub command: {e}"))?;
+            },
+        )
+        .await?;
 
-        self.send_book_stream_unsubscribe(&cmd_tx, coin, BookStreamUse::Depth10)
+        self.send_book_stream_unsubscribe(slot, coin, BookStreamUse::Depth10)
+            .await
     }
 
     /// Subscribe to best bid/offer (BBO) quotes for an instrument.
@@ -1333,20 +1588,21 @@ impl HyperliquidWebSocketClient {
             .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
         let coin = instrument.raw_symbol().inner();
 
-        let cmd_tx = self.cmd_tx.read().await;
+        let slot = self.slot_for_market_coin(coin);
         self.quote_streams.insert(coin, ());
 
         // Update the handler's coin→instrument mapping for this subscription
-        if let Err(e) = cmd_tx.send(HandlerCommand::UpdateInstrument(instrument.clone())) {
+        if let Err(e) = self
+            .send_to_slot(slot, HandlerCommand::UpdateInstrument(instrument.clone()))
+            .await
+        {
             self.quote_streams.remove(&coin);
             anyhow::bail!("Failed to send UpdateInstrument command: {e}");
         }
 
         let subscription = SubscriptionRequest::Bbo { coin };
 
-        if let Err(e) = cmd_tx.send(HandlerCommand::Subscribe {
-            subscriptions: vec![subscription],
-        }) {
+        if let Err(e) = self.subscribe_on_slot(slot, subscription).await {
             self.quote_streams.remove(&coin);
             anyhow::bail!("Failed to send subscribe command: {e}");
         }
@@ -1360,29 +1616,18 @@ impl HyperliquidWebSocketClient {
 
     /// Subscribe to aggregate asset contexts across all perp dexes.
     pub async fn subscribe_all_dexs_asset_ctxs(&self) -> anyhow::Result<()> {
-        self.cmd_tx
-            .read()
-            .await
-            .send(HandlerCommand::Subscribe {
-                subscriptions: vec![SubscriptionRequest::AllDexsAssetCtxs],
-            })
-            .map_err(|e| anyhow::anyhow!("Failed to send subscribe command: {e}"))?;
+        self.subscribe_on_slot(0, SubscriptionRequest::AllDexsAssetCtxs)
+            .await?;
         Ok(())
     }
 
     /// Subscribe to all mid prices across markets, optionally scoped to a specific dex.
     pub async fn subscribe_all_mids_with_dex(&self, dex: Option<&str>) -> anyhow::Result<()> {
-        let cmd_tx = self.cmd_tx.read().await;
-
         let subscription = SubscriptionRequest::AllMids {
             dex: dex.map(ToString::to_string),
         };
 
-        cmd_tx
-            .send(HandlerCommand::Subscribe {
-                subscriptions: vec![subscription],
-            })
-            .map_err(|e| anyhow::anyhow!("Failed to send subscribe command: {e}"))?;
+        self.subscribe_on_slot(0, subscription).await?;
         Ok(())
     }
 
@@ -1393,29 +1638,18 @@ impl HyperliquidWebSocketClient {
 
     /// Unsubscribe from aggregate asset contexts across all perp dexes.
     pub async fn unsubscribe_all_dexs_asset_ctxs(&self) -> anyhow::Result<()> {
-        self.cmd_tx
-            .read()
-            .await
-            .send(HandlerCommand::Unsubscribe {
-                subscriptions: vec![SubscriptionRequest::AllDexsAssetCtxs],
-            })
-            .map_err(|e| anyhow::anyhow!("Failed to send unsubscribe command: {e}"))?;
+        self.unsubscribe_on_owner_slot(SubscriptionRequest::AllDexsAssetCtxs)
+            .await?;
         Ok(())
     }
 
     /// Unsubscribe from all mid prices across markets, optionally scoped to a specific dex.
     pub async fn unsubscribe_all_mids_with_dex(&self, dex: Option<&str>) -> anyhow::Result<()> {
-        let cmd_tx = self.cmd_tx.read().await;
-
         let subscription = SubscriptionRequest::AllMids {
             dex: dex.map(ToString::to_string),
         };
 
-        cmd_tx
-            .send(HandlerCommand::Unsubscribe {
-                subscriptions: vec![subscription],
-            })
-            .map_err(|e| anyhow::anyhow!("Failed to send unsubscribe command: {e}"))?;
+        self.unsubscribe_on_owner_slot(subscription).await?;
         Ok(())
     }
 
@@ -1441,7 +1675,8 @@ impl HyperliquidWebSocketClient {
             .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
         let coin = instrument.raw_symbol().inner();
 
-        let cmd_tx = self.cmd_tx.read().await;
+        let slot = self.slot_for_market_coin(coin);
+        let cmd_tx = self.cmd_tx_for_slot(slot).await?;
 
         // Update the handler's coin→instrument mapping for this subscription
         cmd_tx
@@ -1460,9 +1695,12 @@ impl HyperliquidWebSocketClient {
             .map_err(|e| anyhow::anyhow!("Failed to send UpdateTradeSubs command: {e}"))?;
 
         if registration.subscribe {
+            let subscription = SubscriptionRequest::Trades { coin };
+            self.subscription_slots
+                .insert(subscription_to_key(&subscription), slot);
             cmd_tx
                 .send(HandlerCommand::Subscribe {
-                    subscriptions: vec![SubscriptionRequest::Trades { coin }],
+                    subscriptions: vec![subscription],
                 })
                 .map_err(|e| anyhow::anyhow!("Failed to send subscribe command: {e}"))?;
         }
@@ -1495,21 +1733,15 @@ impl HyperliquidWebSocketClient {
         let key = format!("candle:{coin}:{interval}");
         self.bar_types.insert(key.clone(), bar_type);
 
-        let cmd_tx = self.cmd_tx.read().await;
+        let slot = self.slot_for_market_coin(coin);
 
-        cmd_tx
-            .send(HandlerCommand::UpdateInstrument(instrument.clone()))
-            .map_err(|e| anyhow::anyhow!("Failed to send UpdateInstrument command: {e}"))?;
+        self.send_to_slot(slot, HandlerCommand::UpdateInstrument(instrument.clone()))
+            .await?;
 
-        cmd_tx
-            .send(HandlerCommand::AddBarType { key, bar_type })
-            .map_err(|e| anyhow::anyhow!("Failed to send AddBarType command: {e}"))?;
+        self.send_to_slot(slot, HandlerCommand::AddBarType { key, bar_type })
+            .await?;
 
-        cmd_tx
-            .send(HandlerCommand::Subscribe {
-                subscriptions: vec![subscription],
-            })
-            .map_err(|e| anyhow::anyhow!("Failed to send subscribe command: {e}"))?;
+        self.subscribe_on_slot(slot, subscription).await?;
         Ok(())
     }
 
@@ -1530,13 +1762,7 @@ impl HyperliquidWebSocketClient {
         let subscription = SubscriptionRequest::OrderUpdates {
             user: user.to_string(),
         };
-        self.cmd_tx
-            .read()
-            .await
-            .send(HandlerCommand::Subscribe {
-                subscriptions: vec![subscription],
-            })
-            .map_err(|e| anyhow::anyhow!("Failed to send subscribe command: {e}"))?;
+        self.subscribe_on_slot(0, subscription).await?;
         Ok(())
     }
 
@@ -1545,13 +1771,7 @@ impl HyperliquidWebSocketClient {
         let subscription = SubscriptionRequest::UserEvents {
             user: user.to_string(),
         };
-        self.cmd_tx
-            .read()
-            .await
-            .send(HandlerCommand::Subscribe {
-                subscriptions: vec![subscription],
-            })
-            .map_err(|e| anyhow::anyhow!("Failed to send subscribe command: {e}"))?;
+        self.subscribe_on_slot(0, subscription).await?;
         Ok(())
     }
 
@@ -1564,13 +1784,7 @@ impl HyperliquidWebSocketClient {
             user: user.to_string(),
             aggregate_by_time: None,
         };
-        self.cmd_tx
-            .read()
-            .await
-            .send(HandlerCommand::Subscribe {
-                subscriptions: vec![subscription],
-            })
-            .map_err(|e| anyhow::anyhow!("Failed to send subscribe command: {e}"))?;
+        self.subscribe_on_slot(0, subscription).await?;
         Ok(())
     }
 
@@ -1594,9 +1808,20 @@ impl HyperliquidWebSocketClient {
             .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
         let coin = instrument.raw_symbol().inner();
 
-        let cmd_tx = self.cmd_tx.read().await;
+        let subscription = SubscriptionRequest::L2Book {
+            coin,
+            mantissa: None,
+            n_sig_figs: None,
+        };
+        let topic = subscription_to_key(&subscription);
+        let slot = self
+            .subscription_slots
+            .get(&topic)
+            .map(|entry| *entry.value())
+            .unwrap_or_else(|| self.slot_for_market_coin(coin));
 
-        self.send_book_stream_unsubscribe(&cmd_tx, coin, BookStreamUse::Deltas)
+        self.send_book_stream_unsubscribe(slot, coin, BookStreamUse::Deltas)
+            .await
     }
 
     /// Resubscribes the venue `l2Book` stream for an instrument in place.
@@ -1613,9 +1838,6 @@ impl HyperliquidWebSocketClient {
             .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
         let coin = instrument.raw_symbol().inner();
 
-        // Serialize the registry check with read-locked subscribe/unsubscribe senders
-        let cmd_tx = self.cmd_tx.write().await;
-
         let Some(options) = self.book_streams.options(&coin) else {
             log::debug!("Skipping l2Book resubscribe for {coin}: stream no longer registered");
             return Ok(());
@@ -1626,13 +1848,19 @@ impl HyperliquidWebSocketClient {
             mantissa: options.mantissa,
             n_sig_figs: options.n_sig_figs,
         };
+        let topic = subscription_to_key(&subscription);
+        let slot = self
+            .subscription_slots
+            .get(&topic)
+            .map(|entry| *entry.value())
+            .unwrap_or_else(|| self.slot_for_market_coin(coin));
 
-        Self::send_stream_resubscribe(&cmd_tx, subscription)
+        self.send_stream_resubscribe(slot, subscription).await
     }
 
-    fn send_book_stream_subscribe(
+    async fn send_book_stream_subscribe(
         &self,
-        cmd_tx: &tokio::sync::mpsc::UnboundedSender<HandlerCommand>,
+        slot: usize,
         coin: Ustr,
         stream_use: BookStreamUse,
         n_sig_figs: Option<u32>,
@@ -1662,18 +1890,14 @@ impl HyperliquidWebSocketClient {
                 n_sig_figs: registration.options.n_sig_figs,
             };
 
-            cmd_tx
-                .send(HandlerCommand::Subscribe {
-                    subscriptions: vec![subscription],
-                })
-                .map_err(|e| anyhow::anyhow!("Failed to send subscribe command: {e}"))?;
+            self.subscribe_on_slot(slot, subscription).await?;
         }
         Ok(())
     }
 
-    fn send_book_stream_unsubscribe(
+    async fn send_book_stream_unsubscribe(
         &self,
-        cmd_tx: &tokio::sync::mpsc::UnboundedSender<HandlerCommand>,
+        slot: usize,
         coin: Ustr,
         stream_use: BookStreamUse,
     ) -> anyhow::Result<()> {
@@ -1685,11 +1909,15 @@ impl HyperliquidWebSocketClient {
                     n_sig_figs: options.n_sig_figs,
                 };
 
-                cmd_tx
-                    .send(HandlerCommand::Unsubscribe {
-                        subscriptions: vec![subscription],
-                    })
-                    .map_err(|e| anyhow::anyhow!("Failed to send unsubscribe command: {e}"))?;
+                self.send_to_slot(
+                    slot,
+                    HandlerCommand::Unsubscribe {
+                        subscriptions: vec![subscription.clone()],
+                    },
+                )
+                .await?;
+                self.subscription_slots
+                    .remove(&subscription_to_key(&subscription));
             }
             BookStreamRelease::Retained => {
                 let remaining_use = match stream_use {
@@ -1710,15 +1938,9 @@ impl HyperliquidWebSocketClient {
         let coin = instrument.raw_symbol().inner();
 
         let subscription = SubscriptionRequest::Bbo { coin };
-        let cmd_tx = self.cmd_tx.read().await;
 
         self.quote_streams.remove(&coin);
-
-        cmd_tx
-            .send(HandlerCommand::Unsubscribe {
-                subscriptions: vec![subscription],
-            })
-            .map_err(|e| anyhow::anyhow!("Failed to send unsubscribe command: {e}"))?;
+        self.unsubscribe_on_owner_slot(subscription).await?;
         Ok(())
     }
 
@@ -1731,32 +1953,40 @@ impl HyperliquidWebSocketClient {
             .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
         let coin = instrument.raw_symbol().inner();
 
-        // Keep the registration check atomic with the resubscribe pair
-        let cmd_tx = self.cmd_tx.write().await;
-
         if !self.quote_streams.contains_key(&coin) {
             log::debug!("Skipping bbo resubscribe for {coin}: stream no longer registered");
             return Ok(());
         }
 
-        Self::send_stream_resubscribe(&cmd_tx, SubscriptionRequest::Bbo { coin })
+        let subscription = SubscriptionRequest::Bbo { coin };
+        let topic = subscription_to_key(&subscription);
+        let slot = self
+            .subscription_slots
+            .get(&topic)
+            .map(|entry| *entry.value())
+            .unwrap_or_else(|| self.slot_for_market_coin(coin));
+        self.send_stream_resubscribe(slot, subscription).await
     }
 
-    fn send_stream_resubscribe(
-        cmd_tx: &tokio::sync::mpsc::UnboundedSender<HandlerCommand>,
+    async fn send_stream_resubscribe(
+        &self,
+        slot: usize,
         subscription: SubscriptionRequest,
     ) -> anyhow::Result<()> {
-        cmd_tx
-            .send(HandlerCommand::Unsubscribe {
+        self.send_to_slot(
+            slot,
+            HandlerCommand::Unsubscribe {
                 subscriptions: vec![subscription.clone()],
-            })
-            .map_err(|e| anyhow::anyhow!("Failed to send unsubscribe command: {e}"))?;
-
-        cmd_tx
-            .send(HandlerCommand::Subscribe {
+            },
+        )
+        .await?;
+        self.send_to_slot(
+            slot,
+            HandlerCommand::Subscribe {
                 subscriptions: vec![subscription],
-            })
-            .map_err(|e| anyhow::anyhow!("Failed to send subscribe command: {e}"))?;
+            },
+        )
+        .await?;
         Ok(())
     }
 
@@ -1785,7 +2015,14 @@ impl HyperliquidWebSocketClient {
             .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
         let coin = instrument.raw_symbol().inner();
 
-        let cmd_tx = self.cmd_tx.read().await;
+        let subscription = SubscriptionRequest::Trades { coin };
+        let topic = subscription_to_key(&subscription);
+        let slot = self
+            .subscription_slots
+            .get(&topic)
+            .map(|entry| *entry.value())
+            .unwrap_or_else(|| self.slot_for_market_coin(coin));
+        let cmd_tx = self.cmd_tx_for_slot(slot).await?;
         // Keep registry mutations and their handler commands ordered across
         // concurrent generic/custom unsubscriptions for the same coin.
         let _trade_stream_guard = self.trade_stream_lock.lock().expect(MUTEX_POISONED);
@@ -1800,9 +2037,10 @@ impl HyperliquidWebSocketClient {
         if release.unsubscribe {
             cmd_tx
                 .send(HandlerCommand::Unsubscribe {
-                    subscriptions: vec![SubscriptionRequest::Trades { coin }],
+                    subscriptions: vec![subscription],
                 })
                 .map_err(|e| anyhow::anyhow!("Failed to send unsubscribe command: {e}"))?;
+            self.subscription_slots.remove(&topic);
         }
         Ok(())
     }
@@ -1835,17 +2073,16 @@ impl HyperliquidWebSocketClient {
         let key = format!("candle:{coin}:{interval}");
         self.bar_types.remove(&key);
 
-        let cmd_tx = self.cmd_tx.read().await;
+        let topic = subscription_to_key(&subscription);
+        let slot = self
+            .subscription_slots
+            .get(&topic)
+            .map(|entry| *entry.value())
+            .unwrap_or_else(|| self.slot_for_market_coin(coin));
 
-        cmd_tx
-            .send(HandlerCommand::RemoveBarType { key })
-            .map_err(|e| anyhow::anyhow!("Failed to send RemoveBarType command: {e}"))?;
-
-        cmd_tx
-            .send(HandlerCommand::Unsubscribe {
-                subscriptions: vec![subscription],
-            })
-            .map_err(|e| anyhow::anyhow!("Failed to send unsubscribe command: {e}"))?;
+        self.send_to_slot(slot, HandlerCommand::RemoveBarType { key })
+            .await?;
+        self.unsubscribe_on_owner_slot(subscription).await?;
         Ok(())
     }
 
@@ -1875,12 +2112,27 @@ impl HyperliquidWebSocketClient {
         self.all_dex_asset_ctxs_instrument_ids
             .store(mapping.clone());
 
-        if let Ok(cmd_tx) = self.cmd_tx.try_read()
-            && let Err(e) = cmd_tx.send(HandlerCommand::CacheAllDexAssetCtxsInstrumentIds(mapping))
-        {
-            log::debug!(
-                "Failed to send CacheAllDexAssetCtxsInstrumentIds command (handler may not be connected yet): {e}"
-            );
+        let cmd_txs = self.cmd_txs.read().expect(MUTEX_POISONED).clone();
+        if cmd_txs.is_empty() {
+            if let Ok(cmd_tx) = self.cmd_tx.try_read()
+                && let Err(e) = cmd_tx.send(
+                    HandlerCommand::CacheAllDexAssetCtxsInstrumentIds(mapping),
+                )
+            {
+                log::debug!(
+                    "Failed to send CacheAllDexAssetCtxsInstrumentIds command (handler may not be connected yet): {e}"
+                );
+            }
+        } else {
+            for (slot, cmd_tx) in cmd_txs.into_iter().enumerate() {
+                if let Err(e) = cmd_tx.send(
+                    HandlerCommand::CacheAllDexAssetCtxsInstrumentIds(mapping.clone()),
+                ) {
+                    log::debug!(
+                        "Failed to send CacheAllDexAssetCtxsInstrumentIds command to slot {slot}: {e}"
+                    );
+                }
+            }
         }
     }
 
@@ -1900,11 +2152,12 @@ impl HyperliquidWebSocketClient {
         let data_types = entry.clone();
         drop(entry);
 
-        let cmd_tx = self.cmd_tx.read().await;
-
-        cmd_tx
-            .send(HandlerCommand::UpdateAssetContextSubs { coin, data_types })
-            .map_err(|e| anyhow::anyhow!("Failed to send UpdateAssetContextSubs command: {e}"))?;
+        let slot = self.slot_for_market_coin(coin);
+        self.send_to_slot(
+            slot,
+            HandlerCommand::UpdateAssetContextSubs { coin, data_types },
+        )
+        .await?;
 
         if is_first_subscription {
             log::debug!(
@@ -1912,15 +2165,10 @@ impl HyperliquidWebSocketClient {
             );
             let subscription = SubscriptionRequest::ActiveAssetCtx { coin };
 
-            cmd_tx
-                .send(HandlerCommand::UpdateInstrument(instrument.clone()))
-                .map_err(|e| anyhow::anyhow!("Failed to send UpdateInstrument command: {e}"))?;
+            self.send_to_slot(slot, HandlerCommand::UpdateInstrument(instrument.clone()))
+                .await?;
 
-            cmd_tx
-                .send(HandlerCommand::Subscribe {
-                    subscriptions: vec![subscription],
-                })
-                .map_err(|e| anyhow::anyhow!("Failed to send subscribe command: {e}"))?;
+            self.subscribe_on_slot(slot, subscription).await?;
         } else {
             log::debug!(
                 "Already subscribed to ActiveAssetCtx for coin '{coin}', adding {data_type:?} to tracked types"
@@ -1946,8 +2194,6 @@ impl HyperliquidWebSocketClient {
             let data_types = entry.clone();
             drop(entry);
 
-            let cmd_tx = self.cmd_tx.read().await;
-
             if should_unsubscribe {
                 self.asset_context_subs.remove(&coin);
 
@@ -1955,31 +2201,41 @@ impl HyperliquidWebSocketClient {
                     "Last asset context subscription removed for coin '{coin}', unsubscribing from ActiveAssetCtx"
                 );
                 let subscription = SubscriptionRequest::ActiveAssetCtx { coin };
+                let topic = subscription_to_key(&subscription);
+                let slot = self
+                    .subscription_slots
+                    .get(&topic)
+                    .map(|entry| *entry.value())
+                    .unwrap_or_else(|| self.slot_for_market_coin(coin));
 
-                cmd_tx
-                    .send(HandlerCommand::UpdateAssetContextSubs {
+                self.send_to_slot(
+                    slot,
+                    HandlerCommand::UpdateAssetContextSubs {
                         coin,
                         data_types: AHashSet::new(),
-                    })
-                    .map_err(|e| {
-                        anyhow::anyhow!("Failed to send UpdateAssetContextSubs command: {e}")
-                    })?;
+                    },
+                )
+                .await?;
 
-                cmd_tx
-                    .send(HandlerCommand::Unsubscribe {
-                        subscriptions: vec![subscription],
-                    })
-                    .map_err(|e| anyhow::anyhow!("Failed to send unsubscribe command: {e}"))?;
+                self.unsubscribe_on_owner_slot(subscription).await?;
             } else {
                 log::debug!(
                     "Removed {data_type:?} from tracked types for coin '{coin}', but keeping ActiveAssetCtx subscription"
                 );
 
-                cmd_tx
-                    .send(HandlerCommand::UpdateAssetContextSubs { coin, data_types })
-                    .map_err(|e| {
-                        anyhow::anyhow!("Failed to send UpdateAssetContextSubs command: {e}")
-                    })?;
+                let subscription = SubscriptionRequest::ActiveAssetCtx { coin };
+                let topic = subscription_to_key(&subscription);
+                let slot = self
+                    .subscription_slots
+                    .get(&topic)
+                    .map(|entry| *entry.value())
+                    .unwrap_or_else(|| self.slot_for_market_coin(coin));
+
+                self.send_to_slot(
+                    slot,
+                    HandlerCommand::UpdateAssetContextSubs { coin, data_types },
+                )
+                .await?;
             }
         }
 
@@ -2244,6 +2500,28 @@ fn subscription_from_topic(topic: &str) -> anyhow::Result<SubscriptionRequest> {
         | HyperliquidWsChannel::Error => {
             anyhow::bail!("Not a subscription channel: {kind}")
         }
+    }
+}
+
+fn subscription_coin(subscription: &SubscriptionRequest) -> Option<Ustr> {
+    match subscription {
+        SubscriptionRequest::L2Book { coin, .. }
+        | SubscriptionRequest::Trades { coin }
+        | SubscriptionRequest::Candle { coin, .. }
+        | SubscriptionRequest::Bbo { coin }
+        | SubscriptionRequest::ActiveAssetCtx { coin }
+        | SubscriptionRequest::ActiveSpotAssetCtx { coin } => Some(*coin),
+        SubscriptionRequest::ActiveAssetData { coin, .. } => Some(Ustr::from(coin.as_str())),
+        SubscriptionRequest::AllMids { .. }
+        | SubscriptionRequest::Notification { .. }
+        | SubscriptionRequest::WebData2 { .. }
+        | SubscriptionRequest::OrderUpdates { .. }
+        | SubscriptionRequest::UserEvents { .. }
+        | SubscriptionRequest::UserFills { .. }
+        | SubscriptionRequest::UserFundings { .. }
+        | SubscriptionRequest::UserNonFundingLedgerUpdates { .. }
+        | SubscriptionRequest::UserTwapSliceFills { .. }
+        | SubscriptionRequest::UserTwapHistory { .. } => None,
     }
 }
 

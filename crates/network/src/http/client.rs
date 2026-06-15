@@ -257,6 +257,7 @@ impl HttpClient {
             header_keys: Arc::from(valid_keys),
             header_names: Arc::from(header_names),
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+            local_addr,
         };
 
         Ok(Self {
@@ -450,6 +451,7 @@ pub struct InnerHttpClient {
     pub(crate) header_names: Arc<[HeaderName]>,
     /// Maximum response body size in bytes; bodies exceeding this are rejected.
     pub(crate) max_response_bytes: usize,
+    pub(crate) local_addr: Option<IpAddr>,
 }
 
 impl InnerHttpClient {
@@ -553,13 +555,23 @@ impl InnerHttpClient {
             None => request_builder.build().map_err(HttpClientError::from)?,
         };
 
-        log::trace!("{} {}", request.method(), request.url());
+        log::trace!(
+            "{} {} local_addr={:?}",
+            request.method(),
+            request.url(),
+            self.local_addr
+        );
 
         let response = self
             .client
             .execute(request)
             .await
             .map_err(HttpClientError::from)?;
+        log::trace!(
+            "HTTP response status={} local_addr={:?}",
+            response.status(),
+            self.local_addr
+        );
 
         self.to_response(response).await
     }
@@ -648,6 +660,7 @@ impl Default for InnerHttpClient {
             header_keys: Arc::default(),
             header_names: Arc::default(),
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+            local_addr: None,
         }
     }
 }
@@ -1268,15 +1281,8 @@ mod tests {
     fn test_http_client_with_local_addr_none_matches_default() {
         // `new_with_local_addr(..., None)` should behave identically to `new(...)`.
         let a = HttpClient::new(HashMap::new(), vec![], vec![], None, None, None);
-        let b = HttpClient::new_with_local_addr(
-            HashMap::new(),
-            vec![],
-            vec![],
-            None,
-            None,
-            None,
-            None,
-        );
+        let b =
+            HttpClient::new_with_local_addr(HashMap::new(), vec![], vec![], None, None, None, None);
         assert!(a.is_ok());
         assert!(b.is_ok());
     }

@@ -414,6 +414,12 @@ impl WebSocketClientInner {
                 ),
             ))
         })??;
+        log::info!(
+            "WebSocket connected url={} backend={:?} local_addr={:?}",
+            config.url,
+            config.backend,
+            config.local_addr
+        );
 
         let connection_mode = Arc::new(AtomicU8::new(ConnectionMode::Active.as_u8()));
         let connection_epoch = Arc::new(AtomicU64::new(0));
@@ -598,9 +604,7 @@ impl WebSocketClientInner {
             use std::net::SocketAddr;
 
             use tokio::net::{TcpSocket, lookup_host};
-            use tokio_tungstenite::{
-                MaybeTlsStream, Connector, client_async_tls_with_config,
-            };
+            use tokio_tungstenite::{Connector, MaybeTlsStream, client_async_tls_with_config};
 
             let uri = request.uri();
             let scheme = uri.scheme_str().unwrap_or("ws");
@@ -615,7 +619,10 @@ impl WebSocketClientInner {
             // Resolve the target host to the address family matching `local_ip`.
             let lookup_addr = format!("{host}:{port}");
             let mut peer_addr: Option<SocketAddr> = None;
-            for candidate in lookup_host(&lookup_addr).await.map_err(TransportError::Io)? {
+            for candidate in lookup_host(&lookup_addr)
+                .await
+                .map_err(TransportError::Io)?
+            {
                 let family_match = matches!(
                     (local_ip, candidate),
                     (std::net::IpAddr::V4(_), SocketAddr::V4(_))
@@ -653,9 +660,10 @@ impl WebSocketClientInner {
                     .await
                     .map_err(TransportError::from)?
             } else {
-                let (s, r) = tokio_tungstenite::client_async(request, MaybeTlsStream::Plain(tcp_stream))
-                    .await
-                    .map_err(TransportError::from)?;
+                let (s, r) =
+                    tokio_tungstenite::client_async(request, MaybeTlsStream::Plain(tcp_stream))
+                        .await
+                        .map_err(TransportError::from)?;
                 (s, r)
             };
             let transport: BoxedWsTransport = Box::pin(TungsteniteTransport::new(stream));
