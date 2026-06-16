@@ -394,14 +394,9 @@ impl WebSocketClientInner {
                 None => Self::connect_tungstenite(url, headers, local_addr).await,
             },
             TransportBackend::Sockudo => {
-                if local_addr.is_some() {
-                    log::warn!(
-                        "Sockudo backend does not honour local_addr; the connection will use the kernel default source IP"
-                    );
-                }
                 #[cfg(feature = "transport-sockudo")]
                 {
-                    Self::connect_sockudo(url, headers).await
+                    Self::connect_sockudo(url, headers, local_addr).await
                 }
                 #[cfg(not(feature = "transport-sockudo"))]
                 {
@@ -689,6 +684,7 @@ impl WebSocketClientInner {
     async fn connect_sockudo(
         url: &str,
         headers: Vec<(String, String)>,
+        local_addr: Option<std::net::IpAddr>,
     ) -> Result<(MessageWriter, MessageReader), TransportError> {
         let target = SockudoTarget::parse(url)?;
         validate_extra_headers(&headers).map_err(TransportError::from)?;
@@ -700,9 +696,7 @@ impl WebSocketClientInner {
             ));
         }
 
-        let tcp_stream = TcpStream::connect((target.host.as_str(), target.port))
-            .await
-            .map_err(TransportError::Io)?;
+        let tcp_stream = Self::connect_sockudo_tcp(&target, local_addr).await?;
 
         if let Err(e) = tcp_stream.set_nodelay(true) {
             log::warn!("Failed to enable TCP_NODELAY for sockudo client: {e:?}");
@@ -726,6 +720,72 @@ impl WebSocketClientInner {
         }
 
         Self::finish_sockudo_handshake(tcp_stream, &target, &headers).await
+    }
+
+    #[cfg(all(feature = "transport-sockudo", not(feature = "turmoil")))]
+    async fn connect_sockudo_tcp(
+        target: &SockudoTarget,
+        local_addr: Option<std::net::IpAddr>,
+    ) -> Result<TcpStream, TransportError> {
+        if let Some(local_ip) = local_addr {
+            use std::net::SocketAddr;
+
+            use tokio::net::{TcpSocket, lookup_host};
+
+            let lookup_addr = format!("{}:{}", target.host, target.port);
+            let mut peer_addr: Option<SocketAddr> = None;
+            for candidate in lookup_host(&lookup_addr)
+                .await
+                .map_err(TransportError::Io)?
+            {
+                let family_match = matches!(
+                    (local_ip, candidate),
+                    (std::net::IpAddr::V4(_), SocketAddr::V4(_))
+                        | (std::net::IpAddr::V6(_), SocketAddr::V6(_))
+                );
+                if family_match {
+                    peer_addr = Some(candidate);
+                    break;
+                }
+            }
+            let peer = peer_addr.ok_or_else(|| {
+                TransportError::Io(std::io::Error::new(
+                    std::io::ErrorKind::AddrNotAvailable,
+                    format!(
+                        "no DNS result for '{}' matched the address family of local_addr {local_ip}",
+                        target.host
+                    ),
+                ))
+            })?;
+
+            let socket = match local_ip {
+                std::net::IpAddr::V4(_) => TcpSocket::new_v4().map_err(TransportError::Io)?,
+                std::net::IpAddr::V6(_) => TcpSocket::new_v6().map_err(TransportError::Io)?,
+            };
+            socket
+                .bind(SocketAddr::new(local_ip, 0))
+                .map_err(TransportError::Io)?;
+            return socket.connect(peer).await.map_err(TransportError::Io);
+        }
+
+        TcpStream::connect((target.host.as_str(), target.port))
+            .await
+            .map_err(TransportError::Io)
+    }
+
+    #[cfg(all(feature = "transport-sockudo", feature = "turmoil"))]
+    async fn connect_sockudo_tcp(
+        target: &SockudoTarget,
+        local_addr: Option<std::net::IpAddr>,
+    ) -> Result<TcpStream, TransportError> {
+        if local_addr.is_some() {
+            log::warn!(
+                "Sockudo local_addr is ignored under the turmoil simulator; the simulator does not model multi-homed source IPs"
+            );
+        }
+        TcpStream::connect((target.host.as_str(), target.port))
+            .await
+            .map_err(TransportError::Io)
     }
 
     #[cfg(feature = "transport-sockudo")]
@@ -874,7 +934,12 @@ impl WebSocketClientInner {
     /// - The reconnection attempt times out.
     /// - The connection to the server fails.
     pub async fn reconnect(&mut self) -> Result<(), TransportError> {
-        log::debug!("Reconnecting");
+        log::info!(
+            "WebSocket reconnecting url={} backend={:?} local_addr={:?}",
+            self.config.url,
+            self.config.backend,
+            self.config.local_addr
+        );
 
         if self.is_stream_mode {
             log::warn!(
@@ -981,7 +1046,12 @@ impl WebSocketClientInner {
                 None
             };
 
-            log::debug!("Reconnect succeeded");
+            log::info!(
+                "WebSocket reconnected url={} backend={:?} local_addr={:?}",
+                self.config.url,
+                self.config.backend,
+                self.config.local_addr
+            );
             Ok(())
         })
         .await
@@ -2785,6 +2855,163 @@ mod rust_tests {
             result.is_ok(),
             "Should receive message after reconnection within timeout"
         );
+
+        client.disconnect().await;
+        server.abort();
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_reconnect_reuses_configured_local_addr() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        #[cfg(target_os = "linux")]
+        let local_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2));
+        #[cfg(not(target_os = "linux"))]
+        let local_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let (peer_tx, mut peer_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let server = task::spawn(async move {
+            for index in 0..2 {
+                let (stream, peer) = listener.accept().await.unwrap();
+                peer_tx.send(peer.ip()).unwrap();
+
+                if let Ok(mut ws) = accept_async(stream).await {
+                    if index == 0 {
+                        drop(ws);
+                    } else {
+                        let _ = ws
+                            .send(WsMessage::Text("reconnected".to_string().into()))
+                            .await;
+                        sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        });
+
+        let (handler, mut rx) = channel_message_handler();
+
+        let config = WebSocketConfig {
+            url: format!("ws://127.0.0.1:{port}"),
+            headers: vec![],
+            heartbeat: None,
+            heartbeat_msg: None,
+            reconnect_timeout_ms: Some(2_000),
+            reconnect_delay_initial_ms: Some(50),
+            reconnect_delay_max_ms: Some(200),
+            reconnect_backoff_factor: Some(1.0),
+            reconnect_jitter_ms: Some(0),
+            reconnect_max_attempts: Some(2),
+            idle_timeout_ms: None,
+            backend: TransportBackend::Tungstenite,
+            proxy_url: None,
+            local_addr: Some(local_ip),
+        };
+
+        let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
+            .await
+            .unwrap();
+
+        let first_peer = peer_rx.recv().await.unwrap();
+        let second_peer = tokio::time::timeout(Duration::from_secs(5), peer_rx.recv())
+            .await
+            .expect("client did not reconnect")
+            .expect("server did not accept reconnect");
+
+        assert_eq!(first_peer, local_ip);
+        assert_eq!(second_peer, local_ip);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(msg) = rx.try_recv()
+                    && matches!(msg, WsMessage::Text(ref text) if AsRef::<str>::as_ref(text) == "reconnected")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("client did not receive post-reconnect message");
+
+        client.disconnect().await;
+        server.abort();
+    }
+
+    #[cfg(all(feature = "transport-sockudo", not(feature = "turmoil")))]
+    #[rstest]
+    #[tokio::test]
+    async fn test_sockudo_reconnect_reuses_configured_local_addr() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        #[cfg(target_os = "linux")]
+        let local_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2));
+        #[cfg(not(target_os = "linux"))]
+        let local_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let (peer_tx, mut peer_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let server = task::spawn(async move {
+            for index in 0..2 {
+                let (stream, peer) = listener.accept().await.unwrap();
+                peer_tx.send(peer.ip()).unwrap();
+
+                if let Ok(mut ws) = accept_async(stream).await {
+                    if index == 0 {
+                        drop(ws);
+                    } else {
+                        let _ = ws
+                            .send(WsMessage::Text("reconnected".to_string().into()))
+                            .await;
+                        sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        });
+
+        let (handler, mut rx) = channel_message_handler();
+
+        let config = WebSocketConfig {
+            url: format!("ws://127.0.0.1:{port}"),
+            headers: vec![],
+            heartbeat: None,
+            heartbeat_msg: None,
+            reconnect_timeout_ms: Some(2_000),
+            reconnect_delay_initial_ms: Some(50),
+            reconnect_delay_max_ms: Some(200),
+            reconnect_backoff_factor: Some(1.0),
+            reconnect_jitter_ms: Some(0),
+            reconnect_max_attempts: Some(2),
+            idle_timeout_ms: None,
+            backend: TransportBackend::Sockudo,
+            proxy_url: None,
+            local_addr: Some(local_ip),
+        };
+
+        let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
+            .await
+            .unwrap();
+
+        let first_peer = peer_rx.recv().await.unwrap();
+        let second_peer = tokio::time::timeout(Duration::from_secs(5), peer_rx.recv())
+            .await
+            .expect("client did not reconnect")
+            .expect("server did not accept reconnect");
+
+        assert_eq!(first_peer, local_ip);
+        assert_eq!(second_peer, local_ip);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(msg) = rx.try_recv()
+                    && matches!(msg, WsMessage::Text(ref text) if AsRef::<str>::as_ref(text) == "reconnected")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("client did not receive post-reconnect message");
 
         client.disconnect().await;
         server.abort();
