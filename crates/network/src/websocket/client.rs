@@ -550,14 +550,9 @@ impl WebSocketClientInner {
                 None => Self::connect_tungstenite(url, headers, local_addr).await,
             },
             TransportBackend::Sockudo => {
-                if local_addr.is_some() {
-                    log::warn!(
-                        "Sockudo backend does not honour local_addr; the connection will use the kernel default source IP"
-                    );
-                }
                 #[cfg(feature = "transport-sockudo")]
                 {
-                    Self::connect_sockudo(url, headers).await
+                    Self::connect_sockudo(url, headers, local_addr).await
                 }
                 #[cfg(not(feature = "transport-sockudo"))]
                 {
@@ -843,6 +838,7 @@ impl WebSocketClientInner {
     async fn connect_sockudo(
         url: &str,
         headers: Vec<(String, String)>,
+        local_addr: Option<std::net::IpAddr>,
     ) -> Result<(MessageWriter, MessageReader), TransportError> {
         let target = SockudoTarget::parse(url)?;
         validate_extra_headers(&headers).map_err(TransportError::from)?;
@@ -854,9 +850,7 @@ impl WebSocketClientInner {
             ));
         }
 
-        let tcp_stream = TcpStream::connect((target.host.as_str(), target.port))
-            .await
-            .map_err(TransportError::Io)?;
+        let tcp_stream = Self::connect_sockudo_tcp(&target, local_addr).await?;
 
         if let Err(e) = tcp_stream.set_nodelay(true) {
             log::warn!("Failed to enable TCP_NODELAY for sockudo client: {e:?}");
@@ -880,6 +874,60 @@ impl WebSocketClientInner {
         }
 
         Self::finish_sockudo_handshake(tcp_stream, &target, &headers).await
+    }
+
+    #[cfg(all(feature = "transport-sockudo", not(feature = "turmoil")))]
+    async fn connect_sockudo_tcp(
+        target: &SockudoTarget,
+        local_addr: Option<std::net::IpAddr>,
+    ) -> Result<TcpStream, TransportError> {
+        if let Some(local_ip) = local_addr {
+            use std::net::SocketAddr;
+
+            use tokio::net::{TcpSocket, lookup_host};
+
+            let lookup_addr = format!("{}:{}", target.host, target.port);
+            let peer = lookup_host(&lookup_addr)
+                .await
+                .map_err(TransportError::Io)?
+                .find(|candidate| candidate.is_ipv4() == local_ip.is_ipv4())
+                .ok_or_else(|| {
+                    TransportError::Io(std::io::Error::new(
+                        std::io::ErrorKind::AddrNotAvailable,
+                        format!(
+                            "no DNS result for '{}' matched the address family of local_addr {local_ip}",
+                            target.host
+                        ),
+                    ))
+                })?;
+            let socket = match local_ip {
+                std::net::IpAddr::V4(_) => TcpSocket::new_v4().map_err(TransportError::Io)?,
+                std::net::IpAddr::V6(_) => TcpSocket::new_v6().map_err(TransportError::Io)?,
+            };
+            socket
+                .bind(SocketAddr::new(local_ip, 0))
+                .map_err(TransportError::Io)?;
+            return socket.connect(peer).await.map_err(TransportError::Io);
+        }
+
+        TcpStream::connect((target.host.as_str(), target.port))
+            .await
+            .map_err(TransportError::Io)
+    }
+
+    #[cfg(all(feature = "transport-sockudo", feature = "turmoil"))]
+    async fn connect_sockudo_tcp(
+        target: &SockudoTarget,
+        local_addr: Option<std::net::IpAddr>,
+    ) -> Result<TcpStream, TransportError> {
+        if local_addr.is_some() {
+            log::warn!(
+                "Sockudo local_addr is ignored under the turmoil simulator; the simulator does not model multi-homed source IPs"
+            );
+        }
+        TcpStream::connect((target.host.as_str(), target.port))
+            .await
+            .map_err(TransportError::Io)
     }
 
     #[cfg(feature = "transport-sockudo")]
@@ -1221,7 +1269,12 @@ impl WebSocketClientInner {
             self.read_fence = None;
         }
 
-        log::debug!("Reconnect succeeded");
+        log::info!(
+            "WebSocket reconnected url={} backend={:?} local_addr={:?}",
+            self.config.url,
+            self.config.backend,
+            self.config.local_addr
+        );
         Ok(())
     }
 
