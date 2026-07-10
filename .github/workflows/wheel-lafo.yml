@@ -1,0 +1,40 @@
+name: wheel-lafo
+on:
+  push:
+    branches: [test-ci-v2]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build-macos-cp312:
+    runs-on: macos-latest
+    env:
+      BUILD_MODE: release
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust 1.97.0
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal
+          rustup default 1.97.0
+          rustc --version
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install uv
+        run: pip install uv
+      - name: Build wheel (maturin)
+        working-directory: python
+        run: |
+          uv run --no-project --no-build --with "maturin==1.14.0" -- \
+            maturin build --release --out ../dist
+      - name: List wheels
+        run: ls -la dist/
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: nautilus-v2-macos-cp312
+          path: dist/*.whl
+          if-no-files-found: error
