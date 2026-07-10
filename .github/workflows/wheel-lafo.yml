@@ -11,6 +11,9 @@ jobs:
     env:
       BUILD_MODE: release
       RUST_BACKTRACE: 1
+      # Force cargo/maturin subprocesses to use 1.97.0 regardless of the
+      # runner's default toolchain (RUSTUP_TOOLCHAIN overrides rustup default).
+      RUSTUP_TOOLCHAIN: "1.97.0"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -18,8 +21,8 @@ jobs:
       - name: Install Rust 1.97.0
         run: |
           rustup toolchain install 1.97.0 --profile minimal
-          rustup default 1.97.0
-          rustc --version
+          rustup override set 1.97.0
+          RUSTUP_TOOLCHAIN=1.97.0 rustc --version
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -27,6 +30,8 @@ jobs:
         run: pip install "uv==0.11.26"
       - name: Build wheel (maturin)
         working-directory: python
+        env:
+          RUSTUP_TOOLCHAIN: "1.97.0"
         run: |
           uv run --no-project --no-build --with "maturin==1.14.0" -- \
             maturin build --release --out ../dist
