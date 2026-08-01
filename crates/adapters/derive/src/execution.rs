@@ -1330,14 +1330,26 @@ impl ExecutionClient for DeriveExecutionClient {
                 payload.limit_price,
             );
 
-            // Discard the result (and any `trades` it carries): fills arrive on
-            // the `.trades` channel and are deduped by trade id.
             match ws_exec.submit_order(&payload).await {
-                Ok(_) => {
+                Ok(result) => {
                     log::debug!(
                         "Order submitted: client_order_id={}",
                         order_for_task.client_order_id(),
                     );
+                    // V3 may synchronously return fills with the accepted
+                    // order. Send them through the exact WS path so a later
+                    // private-trades update is deduplicated by trade id.
+                    if !result.trades.is_empty() {
+                        dispatch_trades_payload(
+                            DeriveTradesSubscriptionData {
+                                trades: result.trades,
+                            },
+                            &emitter,
+                            account_id,
+                            clock,
+                            &dispatch_state,
+                        );
+                    }
                 }
                 // See docs/integrations/derive.md "Order rejection semantics".
                 Err(e) if is_write_outcome_ambiguous_ws(&e) => {

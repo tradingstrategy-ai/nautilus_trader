@@ -15,9 +15,9 @@
 
 //! Per-`(wallet, subaccount)` nonce manager for Derive self-custodial requests.
 //!
-//! Nonce format (matching `derive_action_signing/utils.py::get_action_nonce`):
-//! `int(str(utc_ms) || str(suffix))`. The suffix is a non-negative integer
-//! whose decimal representation is concatenated to the millisecond timestamp.
+//! V3 nonce format: `utc_ms * 1_000_000 + suffix`, serialized as a decimal
+//! string at the JSON-RPC boundary. The six-digit suffix gives distinct values
+//! to concurrent actions generated in the same millisecond.
 //!
 //! Manager guarantees:
 //!
@@ -79,8 +79,7 @@ impl NonceManager {
     /// injected `now_ms`, suitable for deterministic testing.
     pub fn next_nonce_at(&self, wallet: &str, subaccount_id: u64, now_ms: u64) -> u64 {
         let state = self.state_for(wallet, subaccount_id);
-        // Suffix "0" -> multiply ms by 10 and append 0 (which is just *10).
-        let initial = now_ms.saturating_mul(10);
+        let initial = now_ms.saturating_mul(1_000_000);
 
         loop {
             let last = state.load(Ordering::Acquire);
@@ -163,11 +162,10 @@ mod tests {
     const WALLET_B: &str = "0x000000000000000000000000000000000000bbbb";
 
     #[rstest]
-    fn test_next_nonce_at_first_call_concatenates_zero_suffix() {
+    fn test_next_nonce_at_first_call_uses_nanosecond_prefix() {
         let mgr = NonceManager::new();
         let nonce = mgr.next_nonce_at(WALLET_A, 1, 1_700_000_000_000);
-        // ms appended with "0" -> ms * 10
-        assert_eq!(nonce, 17_000_000_000_000);
+        assert_eq!(nonce, 1_700_000_000_000_000_000);
     }
 
     #[rstest]
@@ -189,10 +187,8 @@ mod tests {
         let mgr = NonceManager::new();
         let n1 = mgr.next_nonce_at(WALLET_A, 1, 1_700_000_000_000);
         let n2 = mgr.next_nonce_at(WALLET_A, 1, 1_700_000_000_001);
-        // n1 = ms * 10 = 17000000000000
-        // n2 should restart at ms2 * 10 = 17000000000010, larger by 10.
-        assert_eq!(n1, 17_000_000_000_000);
-        assert_eq!(n2, 17_000_000_000_010);
+        assert_eq!(n1, 1_700_000_000_000_000_000);
+        assert_eq!(n2, 1_700_000_000_001_000_000);
         assert!(n2 > n1);
     }
 
@@ -221,9 +217,10 @@ mod tests {
     fn test_refresh_advances_last_issued() {
         let mgr = NonceManager::new();
         mgr.next_nonce_at(WALLET_A, 1, 1_700_000_000_000);
-        mgr.refresh(WALLET_A, 1, 99_999_999_999_999);
+        let venue_nonce = 1_700_000_000_000_123_456;
+        mgr.refresh(WALLET_A, 1, venue_nonce);
         let n = mgr.next_nonce_at(WALLET_A, 1, 1_700_000_000_000);
-        assert_eq!(n, 99_999_999_999_999 + 1);
+        assert_eq!(n, venue_nonce + 1);
     }
 
     #[rstest]
@@ -300,10 +297,10 @@ mod tests {
         }
         all.sort_unstable();
         let total = (threads * per_thread) as u64;
-        let expected: Vec<u64> = (0..total).map(|i| now_ms * 10 + i).collect();
+        let expected: Vec<u64> = (0..total).map(|i| now_ms * 1_000_000 + i).collect();
         assert_eq!(
             all, expected,
-            "concurrent issuance must be contiguous from ms*10",
+            "concurrent issuance must be contiguous from the nanosecond prefix",
         );
     }
 
@@ -312,7 +309,7 @@ mod tests {
         let mgr = NonceManager::new();
         let n = mgr.next_nonce(WALLET_A, 1).unwrap();
         // System clock must be past Jan 2026 (1.7e12 ms), and the nonce is
-        // ms * 10 so it must exceed 1.7e13.
-        assert!(n > 17_000_000_000_000, "nonce too small: {n}");
+        // ms * 1_000_000 so it must exceed 1.7e18.
+        assert!(n > 1_700_000_000_000_000_000, "nonce too small: {n}");
     }
 }

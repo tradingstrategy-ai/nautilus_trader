@@ -25,8 +25,8 @@
 //! 2. Sign the bytes with EIP-191 `personal_sign(timestamp_bytes,
 //!    session_key)`. Alloy's [`SignerSync::sign_message_sync`] applies the
 //!    `\x19Ethereum Signed Message:\n<len>` prefix automatically.
-//! 3. Send headers `X-LYRAWALLET = wallet`, `X-LYRATIMESTAMP = timestamp`,
-//!    `X-LYRASIGNATURE = 0x-prefixed_signature_hex`.
+//! 3. Send headers `X-DeriveWallet = wallet`, `X-DeriveTimestamp = timestamp`,
+//!    `X-DeriveSignature = 0x-prefixed_signature_hex`.
 //!
 //! WebSocket login mirrors this with a JSON body of `{wallet, timestamp,
 //! signature}` instead of headers.
@@ -53,11 +53,11 @@ pub enum AuthError {
 /// Headers sent with REST requests authenticated against a session key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthHeaders {
-    /// Smart-contract wallet address (`X-LYRAWALLET`).
+    /// Smart-contract wallet address (`X-DeriveWallet`).
     pub wallet: String,
-    /// Millisecond UNIX timestamp string (`X-LYRATIMESTAMP`).
+    /// Millisecond UNIX timestamp string (`X-DeriveTimestamp`).
     pub timestamp: String,
-    /// 0x-prefixed signature hex (`X-LYRASIGNATURE`).
+    /// 0x-prefixed signature hex (`X-DeriveSignature`).
     pub signature: String,
 }
 

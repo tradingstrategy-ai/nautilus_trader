@@ -856,14 +856,14 @@ impl DeriveWsExecutionHandle {
     ///
     /// `params` must be the fully-built signed body from
     /// [`crate::http::query::order_to_derive_payload`]. Returns the accepted
-    /// order echoed by the venue.
+    /// order and any immediately created trades echoed by the venue.
     ///
     /// # Errors
     ///
     /// Returns [`DeriveWsError::JsonRpc`] for venue rejections and
     /// [`DeriveWsError::Transport`] / [`DeriveWsError::Timeout`] when the
     /// outcome is ambiguous.
-    pub async fn submit_order(&self, params: &DeriveOrderParams) -> Result<DeriveOrder> {
+    pub async fn submit_order(&self, params: &DeriveOrderParams) -> Result<DeriveOrderResult> {
         let cmd_tx = self.cmd_tx.read().await.clone();
         let result: DeriveOrderResult = send_request_typed(
             &self.rate_limiter,
@@ -873,7 +873,7 @@ impl DeriveWsExecutionHandle {
             self.request_timeout,
         )
         .await?;
-        Ok(result.order)
+        Ok(result)
     }
 
     /// Submits a signed trigger order via `private/trigger_order`.
@@ -1173,21 +1173,21 @@ mod tests {
             None,
         );
         assert!(client.url().starts_with("wss://"));
-        assert!(client.url().contains("api.lyra.finance"));
+        assert_eq!(client.url(), "wss://api.derive.xyz/v3/ws");
         assert!(!client.is_authenticated());
         assert!(!client.is_active());
         assert_eq!(client.subscription_count(), 0);
     }
 
     #[rstest]
-    fn test_testnet_client_routes_to_demo_url() {
+    fn test_testnet_client_routes_to_v3_testnet_url() {
         let client = DeriveWebSocketClient::new(
             None,
             DeriveEnvironment::Testnet,
             TransportBackend::default(),
             None,
         );
-        assert!(client.url().contains("demo"));
+        assert_eq!(client.url(), "wss://testnet.api.derive.xyz/v3/ws");
     }
 
     #[rstest]
@@ -1206,7 +1206,7 @@ mod tests {
             creds,
             None,
         );
-        assert!(client.url().contains("demo"));
+        assert_eq!(client.url(), "wss://testnet.api.derive.xyz/v3/ws");
         assert!(!client.is_authenticated());
     }
 

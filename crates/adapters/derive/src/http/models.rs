@@ -108,6 +108,23 @@ where
     }
 }
 
+fn deserialize_i64_from_string_or_number<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Integer {
+        String(String),
+        Number(i64),
+    }
+
+    match Integer::deserialize(deserializer)? {
+        Integer::String(value) => value.parse().map_err(serde::de::Error::custom),
+        Integer::Number(value) => Ok(value),
+    }
+}
+
 /// JSON-RPC error object as returned by Derive on failed requests.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct JsonRpcError {
@@ -485,6 +502,7 @@ pub struct DeriveOrder {
     /// Whether MMP tags this order.
     pub mmp: bool,
     /// Order nonce.
+    #[serde(deserialize_with = "deserialize_i64_from_string_or_number")]
     pub nonce: i64,
     /// Total fees paid against this order.
     #[serde(deserialize_with = "deserialize_decimal")]
@@ -747,6 +765,10 @@ pub struct DeriveTrade {
     /// Realized PnL booked by this trade.
     #[serde(deserialize_with = "deserialize_decimal")]
     pub realized_pnl: Decimal,
+    /// Realized PnL before fees and rebates. Added by v3; zero for legacy
+    /// fixture compatibility where the field was not present.
+    #[serde(default, deserialize_with = "deserialize_decimal")]
+    pub realized_pnl_excl_fees: Decimal,
     /// Owning subaccount.
     pub subaccount_id: i64,
     /// Trade timestamp (UNIX ms).
@@ -757,6 +779,9 @@ pub struct DeriveTrade {
     /// Fee charged for this trade.
     #[serde(deserialize_with = "deserialize_decimal")]
     pub trade_fee: Decimal,
+    /// Expected maker rebate for this fill. Added by v3.
+    #[serde(default, deserialize_with = "deserialize_decimal")]
+    pub expected_rebate: Decimal,
     /// Trade identifier.
     pub trade_id: String,
     /// Trade execution price.

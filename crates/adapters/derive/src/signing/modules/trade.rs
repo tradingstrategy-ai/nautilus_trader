@@ -26,7 +26,7 @@
 //! contract definition. `max_fee` is unsigned and rejects negative input.
 
 use alloy::sol_types::SolValue;
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, I256, U256};
 use rust_decimal::Decimal;
 
 use crate::signing::{
@@ -65,6 +65,13 @@ pub enum TradeEncodeError {
         /// Underlying overflow reason.
         reason: &'static str,
     },
+    /// V3 matching stores decimal values at 1e12. Signed ABI words still use
+    /// 1e18, therefore the final six digits must be zero.
+    #[error("trade module field {field} has more than 12 decimal places")]
+    Precision {
+        /// Field rejected before signing.
+        field: &'static str,
+    },
 }
 
 impl TradeModuleData {
@@ -95,6 +102,10 @@ impl TradeModuleData {
             }
         })?;
 
+        ensure_e12_i256(limit_price, "limit_price")?;
+        ensure_e12_i256(amount, "amount")?;
+        ensure_e12_u256(max_fee, "max_fee")?;
+
         let tuple = (
             self.asset_address,
             self.sub_id,
@@ -106,6 +117,21 @@ impl TradeModuleData {
         );
         Ok(tuple.abi_encode())
     }
+}
+
+fn ensure_e12_i256(value: I256, field: &'static str) -> Result<(), TradeEncodeError> {
+    let scale = I256::from_raw(U256::from(1_000_000_u64));
+    if value % scale != I256::ZERO {
+        return Err(TradeEncodeError::Precision { field });
+    }
+    Ok(())
+}
+
+fn ensure_e12_u256(value: U256, field: &'static str) -> Result<(), TradeEncodeError> {
+    if value % U256::from(1_000_000_u64) != U256::ZERO {
+        return Err(TradeEncodeError::Precision { field });
+    }
+    Ok(())
 }
 
 impl ModuleData for TradeModuleData {
@@ -284,5 +310,15 @@ mod tests {
         let mut out = [0u8; 20];
         out.copy_from_slice(bytes);
         out
+    }
+
+    #[rstest]
+    fn test_encode_rejects_sub_e12_precision() {
+        let mut data = sample();
+        data.amount = dec!(1.0000000000001);
+        assert_eq!(
+            data.encode().unwrap_err(),
+            TradeEncodeError::Precision { field: "amount" }
+        );
     }
 }

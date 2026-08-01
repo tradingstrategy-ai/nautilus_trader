@@ -51,6 +51,10 @@ pub struct DeriveSignedEnvelope {
     /// Owning subaccount identifier.
     pub subaccount_id: u64,
     /// Per-action nonce.
+    #[serde(
+        serialize_with = "serialize_nonce_as_string",
+        deserialize_with = "deserialize_nonce_from_string_or_number"
+    )]
     pub nonce: u64,
     /// Session-key signer address.
     pub signer: String,
@@ -58,6 +62,30 @@ pub struct DeriveSignedEnvelope {
     pub signature_expiry_sec: i64,
     /// 65-byte EIP-712 signature as `0x`-prefixed hex.
     pub signature: String,
+}
+
+fn serialize_nonce_as_string<S>(nonce: &u64, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&nonce.to_string())
+}
+
+fn deserialize_nonce_from_string_or_number<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Nonce {
+        String(String),
+        Number(u64),
+    }
+
+    match Nonce::deserialize(deserializer)? {
+        Nonce::String(value) => value.parse().map_err(serde::de::Error::custom),
+        Nonce::Number(value) => Ok(value),
+    }
 }
 
 impl DeriveSignedEnvelope {
@@ -1075,7 +1103,7 @@ mod tests {
         assert_eq!(payload["amount"], "1");
         assert_eq!(payload["max_fee"], "1");
         assert_eq!(payload["subaccount_id"], 30769);
-        assert_eq!(payload["nonce"], 17_000_000_000_001_u64);
+        assert_eq!(payload["nonce"], "17000000000001");
         assert!(payload["signature_expiry_sec"].as_i64().unwrap() > 0);
         let signature = payload["signature"].as_str().unwrap();
         assert!(signature.starts_with("0x"));
@@ -1534,7 +1562,7 @@ mod tests {
         assert_eq!(payload["time_in_force"], "gtc");
         assert_eq!(payload["label"], "STRAT-PAYLOAD-1");
         assert_eq!(payload["subaccount_id"], 30769);
-        assert_eq!(payload["nonce"], 17_000_000_000_010_u64);
+        assert_eq!(payload["nonce"], "17000000000010");
         let signature = payload["signature"].as_str().unwrap();
         assert!(signature.starts_with("0x"));
         assert_eq!(signature.len(), 2 + 130);

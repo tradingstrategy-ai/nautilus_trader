@@ -16,7 +16,7 @@
 //! Integration tests for the Derive HTTP client using an axum mock server.
 //!
 //! Covers the request shape produced by `dispatch()`: URL formation,
-//! `Content-Type`, body, and the `X-LYRA*` auth-header injection for
+//! `Content-Type`, body, and the `X-Derive*` auth-header injection for
 //! authenticated calls. Pure decoding behavior lives in the unit tests
 //! beside `decode_envelope`.
 
@@ -39,7 +39,7 @@ use nautilus_common::testing::wait_until_async;
 use nautilus_core::UnixNanos;
 use nautilus_derive::{
     common::{
-        consts::{HEADER_LYRA_SIGNATURE, HEADER_LYRA_TIMESTAMP, HEADER_LYRA_WALLET},
+        consts::{HEADER_DERIVE_SIGNATURE, HEADER_DERIVE_TIMESTAMP, HEADER_DERIVE_WALLET},
         enums::{DeriveInstrumentType, DeriveOrderSide, DeriveOrderType, DeriveTimeInForce},
         retry::http_retry_config,
     },
@@ -268,17 +268,17 @@ async fn test_send_public_posts_params_with_no_auth_headers() {
     assert!(
         !captured
             .headers
-            .contains_key(&HEADER_LYRA_WALLET.to_lowercase())
+            .contains_key(&HEADER_DERIVE_WALLET.to_lowercase())
     );
     assert!(
         !captured
             .headers
-            .contains_key(&HEADER_LYRA_TIMESTAMP.to_lowercase())
+            .contains_key(&HEADER_DERIVE_TIMESTAMP.to_lowercase())
     );
     assert!(
         !captured
             .headers
-            .contains_key(&HEADER_LYRA_SIGNATURE.to_lowercase())
+            .contains_key(&HEADER_DERIVE_SIGNATURE.to_lowercase())
     );
     assert_eq!(instruments.len(), 1);
     assert_eq!(instruments[0].instrument_name, "ETH-PERP");
@@ -303,7 +303,7 @@ async fn test_get_instrument_posts_instrument_name() {
 
 #[rstest]
 #[tokio::test]
-async fn test_send_private_attaches_all_lyra_auth_headers() {
+async fn test_send_private_attaches_all_derive_auth_headers() {
     let state = TestServerState::with_success_response();
     *state.response_body.lock().await = json!({
         "id": 1,
@@ -350,7 +350,7 @@ async fn test_send_private_attaches_all_lyra_auth_headers() {
             "label": "client-1",
             "limit_price": "3500",
             "max_fee": "1",
-            "nonce": 123,
+            "nonce": "123",
             "order_type": "limit",
             "referral_code": "nautilus",
             "signature": "0x00",
@@ -363,20 +363,20 @@ async fn test_send_private_attaches_all_lyra_auth_headers() {
 
     let wallet = captured
         .headers
-        .get(&HEADER_LYRA_WALLET.to_lowercase())
+        .get(&HEADER_DERIVE_WALLET.to_lowercase())
         .expect("wallet header present");
     assert_eq!(wallet, TEST_WALLET);
 
     let timestamp = captured
         .headers
-        .get(&HEADER_LYRA_TIMESTAMP.to_lowercase())
+        .get(&HEADER_DERIVE_TIMESTAMP.to_lowercase())
         .expect("timestamp header present");
     let ts: u64 = timestamp.parse().expect("timestamp is a u64 millis string");
     assert!(ts > 1_700_000_000_000, "timestamp must be a recent unix ms");
 
     let signature = captured
         .headers
-        .get(&HEADER_LYRA_SIGNATURE.to_lowercase())
+        .get(&HEADER_DERIVE_SIGNATURE.to_lowercase())
         .expect("signature header present");
     assert!(signature.starts_with("0x"));
     assert_eq!(signature.len(), 2 + 130, "signature must be 65 bytes hex");

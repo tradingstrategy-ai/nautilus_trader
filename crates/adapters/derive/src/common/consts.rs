@@ -42,10 +42,10 @@ pub static DERIVE_CLIENT_ID: LazyLock<ClientId> =
 /// see <https://docs.derive.xyz/reference/api-broker> for further details.
 pub const DERIVE_NAUTILUS_REFERRAL_CODE: &str = "nautilus";
 
-pub const REST_URL_MAINNET: &str = "https://api.lyra.finance";
-pub const REST_URL_TESTNET: &str = "https://api-demo.lyra.finance";
-pub const WS_URL_MAINNET: &str = "wss://api.lyra.finance/ws";
-pub const WS_URL_TESTNET: &str = "wss://api-demo.lyra.finance/ws";
+pub const REST_URL_MAINNET: &str = "https://api.derive.xyz/v3";
+pub const REST_URL_TESTNET: &str = "https://testnet.api.derive.xyz/v3";
+pub const WS_URL_MAINNET: &str = "wss://api.derive.xyz/v3/ws";
+pub const WS_URL_TESTNET: &str = "wss://testnet.api.derive.xyz/v3/ws";
 
 pub const DERIVE_TRADES_PAGE_SIZE: u32 = 1000;
 pub const DERIVE_CANDLES_DEFAULT_LIMIT: usize = 1000;
@@ -53,11 +53,11 @@ pub const DERIVE_CANDLES_MAX_PAGES: usize = 100;
 
 /// EIP-712 domain separator (mainnet).
 pub const DOMAIN_SEPARATOR_MAINNET: &str =
-    "0xd96e5f90797da7ec8dc4e276260c7f3f87fedf68775fbe1ef116e996fc60441b";
+    "0xda616dfabb88681b08e1592820a41d55ddc62d68de110e327ae99d734506fe19";
 
 /// EIP-712 domain separator (testnet).
 pub const DOMAIN_SEPARATOR_TESTNET: &str =
-    "0x9bcf4dc06df5d8bf23af818d5716491b995020f377d3b7b64c29ed14e3dd1105";
+    "0x24d674cd5f2b9d564691c51e9d88f649b99246a2244dd74ce27b96578d773e85";
 
 /// EIP-712 action typehash. Identical across networks per Derive's published
 /// Protocol Constants.
@@ -68,7 +68,7 @@ pub const ACTION_TYPEHASH: &str =
 pub const TRADE_MODULE_ADDRESS_MAINNET: &str = "0xB8D20c2B7a1Ad2EE33Bc50eF10876eD3035b5e7b";
 
 /// Trade module contract address (testnet).
-pub const TRADE_MODULE_ADDRESS_TESTNET: &str = "0x87F2863866D85E3192a35A73b388BD625D83f2be";
+pub const TRADE_MODULE_ADDRESS_TESTNET: &str = "0xB8D20c2B7a1Ad2EE33Bc50eF10876eD3035b5e7b";
 
 /// Withdrawal module contract address (mainnet).
 pub const WITHDRAW_MODULE_ADDRESS_MAINNET: &str = "0x9d0E8f5b25384C7310CB8C6aE32C8fbeb645d083";
@@ -107,13 +107,13 @@ pub const fn trade_module_address_for(environment: DeriveEnvironment) -> &'stati
 }
 
 /// REST authentication header carrying the Derive Chain smart-contract wallet.
-pub const HEADER_LYRA_WALLET: &str = "X-LYRAWALLET";
+pub const HEADER_DERIVE_WALLET: &str = "X-DeriveWallet";
 
 /// REST authentication header carrying the signed timestamp.
-pub const HEADER_LYRA_TIMESTAMP: &str = "X-LYRATIMESTAMP";
+pub const HEADER_DERIVE_TIMESTAMP: &str = "X-DeriveTimestamp";
 
 /// REST authentication header carrying the session-key signature.
-pub const HEADER_LYRA_SIGNATURE: &str = "X-LYRASIGNATURE";
+pub const HEADER_DERIVE_SIGNATURE: &str = "X-DeriveSignature";
 
 /// Minimum signature TTL the venue accepts for self-custodial actions.
 ///
@@ -128,8 +128,14 @@ pub const MIN_SIGNATURE_TTL: Duration = Duration::from_secs(5 * 60);
 /// clock drift and request latency.
 pub const TRIGGER_ORDER_SIGNATURE_TTL: Duration = Duration::from_secs(31 * 24 * 60 * 60);
 
-/// Fixed-point scale used by all on-chain decimal fields (1e18).
+/// Fixed-point scale used by all signed ABI decimal fields (1e18).
 pub const DECIMAL_SCALE: u128 = 1_000_000_000_000_000_000;
+
+/// Values on the v3 matching engine may carry at most 12 decimal places.
+/// They are still ABI-encoded in 1e18 words, so the final six digits must be
+/// zero rather than silently truncated.
+pub const PROTOCOL_DECIMAL_SCALE: u128 = 1_000_000_000_000;
+pub const E18_TO_PROTOCOL_SCALE: u128 = 1_000_000;
 
 pub const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -175,6 +181,8 @@ mod tests {
     #[rstest]
     fn test_decimal_scale_is_1e18() {
         assert_eq!(DECIMAL_SCALE, 10u128.pow(18));
+        assert_eq!(PROTOCOL_DECIMAL_SCALE, 10u128.pow(12));
+        assert_eq!(E18_TO_PROTOCOL_SCALE, 10u128.pow(6));
     }
 
     #[rstest]

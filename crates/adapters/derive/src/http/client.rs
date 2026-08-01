@@ -41,7 +41,9 @@ use serde_json::Value;
 
 use crate::{
     common::{
-        consts::{HEADER_LYRA_SIGNATURE, HEADER_LYRA_TIMESTAMP, HEADER_LYRA_WALLET, HTTP_TIMEOUT},
+        consts::{
+            HEADER_DERIVE_SIGNATURE, HEADER_DERIVE_TIMESTAMP, HEADER_DERIVE_WALLET, HTTP_TIMEOUT,
+        },
         enums::DeriveInstrumentType,
         rate_limit::{self, DERIVE_NON_MATCHING_RATE_KEY},
         retry::{http_retry_config, should_retry_http_error},
@@ -640,9 +642,9 @@ impl DeriveHttpClient {
 
             if authenticate {
                 let auth = self.build_auth_headers(method)?;
-                headers.insert(HEADER_LYRA_WALLET.to_string(), auth.wallet);
-                headers.insert(HEADER_LYRA_TIMESTAMP.to_string(), auth.timestamp);
-                headers.insert(HEADER_LYRA_SIGNATURE.to_string(), auth.signature);
+                headers.insert(HEADER_DERIVE_WALLET.to_string(), auth.wallet);
+                headers.insert(HEADER_DERIVE_TIMESTAMP.to_string(), auth.timestamp);
+                headers.insert(HEADER_DERIVE_SIGNATURE.to_string(), auth.signature);
             }
 
             let response = self

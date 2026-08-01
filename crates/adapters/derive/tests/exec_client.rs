@@ -1373,7 +1373,7 @@ async fn test_submit_order_limit_posts_signed_payload() {
     assert_eq!(body["amount"].as_str(), Some("1.000"));
     assert_eq!(body["subaccount_id"].as_u64(), Some(TEST_SUBACCOUNT));
     assert!(body["signature"].as_str().unwrap().starts_with("0x"));
-    assert!(body["nonce"].as_u64().unwrap() > 0);
+    assert!(body["nonce"].as_str().unwrap().parse::<u64>().unwrap() > 0);
 
     tc.client.disconnect().await.expect("disconnect");
 }
@@ -5922,7 +5922,7 @@ async fn test_submit_option_order_resolves_option_instrument_for_signing() {
     // venue-side verification would fail if asset_address / sub_id from
     // the option record were not used.
     assert!(body["signature"].as_str().unwrap().starts_with("0x"));
-    assert!(body["nonce"].as_u64().unwrap() > 0);
+    assert!(body["nonce"].as_str().unwrap().parse::<u64>().unwrap() > 0);
 
     tc.client.disconnect().await.expect("disconnect");
 }

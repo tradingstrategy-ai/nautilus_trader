@@ -114,7 +114,7 @@ impl DeriveDataClientConfig {
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.derive")
 )]
 pub struct DeriveExecClientConfig {
-    /// Derive Chain smart-contract wallet address (`X-LYRAWALLET`). Falls back
+    /// Derive account owner address (`X-DeriveWallet`). Falls back
     /// to `DERIVE_WALLET_ADDRESS` (or `DERIVE_TESTNET_WALLET_ADDRESS` on
     /// testnet) when unset.
     pub wallet_address: Option<String>,
@@ -277,8 +277,8 @@ mod tests {
     #[rstest]
     fn test_data_config_urls_mainnet() {
         let config = DeriveDataClientConfig::default();
-        assert!(config.rest_url().contains("api.lyra.finance"));
-        assert!(config.ws_url().contains("api.lyra.finance"));
+        assert_eq!(config.rest_url(), "https://api.derive.xyz/v3");
+        assert_eq!(config.ws_url(), "wss://api.derive.xyz/v3/ws");
     }
 
     #[rstest]
@@ -287,8 +287,8 @@ mod tests {
             environment: DeriveEnvironment::Testnet,
             ..DeriveDataClientConfig::default()
         };
-        assert!(config.rest_url().contains("demo"));
-        assert!(config.ws_url().contains("demo"));
+        assert_eq!(config.rest_url(), "https://testnet.api.derive.xyz/v3");
+        assert_eq!(config.ws_url(), "wss://testnet.api.derive.xyz/v3/ws");
     }
 
     #[rstest]
