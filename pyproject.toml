@@ -53,6 +53,7 @@ requires = [
 build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
+packages = [{ include = "nautilus_trader" }]
 include = [
   # Rust source must be included in the source distributions
   { path = "crates/*", format = "sdist" },
