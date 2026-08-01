@@ -151,13 +151,15 @@ RUST_LIBS: list[str] = [str(path) for path in RUST_LIB_PATHS]
 def _set_feature_flags() -> list[str]:
     feature_list = [
         "arrow",
-        "cython-compat",
         "extension-module",
         "ffi",
         "postgres",
         "python",
         "tracing-bridge",
     ]
+
+    if not PYO3_ONLY:
+        feature_list.append("cython-compat")
 
     if HIGH_PRECISION:
         feature_list.append("high-precision")
@@ -377,7 +379,12 @@ def _copy_rust_dylibs_to_project() -> None:
     # https://pyo3.rs/latest/building-and-distribution#manual-builds
     ext_suffix = sysconfig.get_config_var("EXT_SUFFIX")
     src = Path(CARGO_TARGET_DIR) / f"{RUST_LIB_PFX}nautilus_pyo3.{RUST_DYLIB_EXT}"
-    dst = Path("nautilus_trader/core") / f"nautilus_pyo3{ext_suffix}"
+    if PYO3_ONLY:
+        # The Rust-core Python package lives under python/ while the source
+        # tree still retains the legacy Cython package at the repository root.
+        dst = Path("python/nautilus_trader") / f"_libnautilus{ext_suffix}"
+    else:
+        dst = Path("nautilus_trader/core") / f"nautilus_pyo3{ext_suffix}"
     shutil.copyfile(src=src, dst=dst)
 
     print(f"Copied {src} to {dst}")

@@ -53,7 +53,10 @@ requires = [
 build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
-packages = [{ include = "nautilus_trader" }]
+# The custom distribution is Rust-core only.  The repository still carries the
+# legacy Cython package at the root during the upstream v2 transition, while
+# the LiveNode adapter shims live under python/.
+packages = [{ include = "nautilus_trader", from = "python" }]
 include = [
   # Rust source must be included in the source distributions
   { path = "crates/*", format = "sdist" },
@@ -61,14 +64,14 @@ include = [
   { path = "Cargo.toml", format = "sdist" },
   { path = ".cargo/*", format = "sdist" },
   # Compiled extensions must be included in the wheel distributions
-  { path = "nautilus_trader/**/*.so", format = "wheel" },
-  { path = "nautilus_trader/**/*.pyd", format = "wheel" },
+  { path = "python/nautilus_trader/**/*.so", format = "wheel" },
+  { path = "python/nautilus_trader/**/*.pyd", format = "wheel" },
   # Include the py.typed file for type checking support
-  { path = "nautilus_trader/py.typed", format = "sdist" },
-  { path = "nautilus_trader/py.typed", format = "wheel" },
+  { path = "python/nautilus_trader/py.typed", format = "sdist" },
+  { path = "python/nautilus_trader/py.typed", format = "wheel" },
   # Include Python interface files for type checking support
-  { path = "nautilus_trader/**/*.pyi", format = "sdist" },
-  { path = "nautilus_trader/**/*.pyi", format = "wheel" },
+  { path = "python/nautilus_trader/**/*.pyi", format = "sdist" },
+  { path = "python/nautilus_trader/**/*.pyi", format = "wheel" },
 ]
 
 [tool.poetry.build]
