@@ -207,6 +207,7 @@ impl Clone for HyperliquidWebSocketClient {
             local_addrs_ws: self.local_addrs_ws.clone(),
             ws_shard_by: self.ws_shard_by,
             ws_rr_counter: Arc::clone(&self.ws_rr_counter),
+        }
     }
 }
 
