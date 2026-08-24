@@ -3084,6 +3084,7 @@ mod tests {
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
+            local_addr: None,
         };
         let client =
             WebSocketClient::connect(config, Some(Arc::new(|_| {})), None, None, vec![], None)
@@ -4266,6 +4267,7 @@ mod rust_tests {
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
+            local_addr: None,
         };
 
         let err = WebSocketClientInner::connect_url(config, Some(handler), None)
@@ -4314,6 +4316,7 @@ mod rust_tests {
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
+            local_addr: None,
         };
 
         let error = WebSocketClientInner::connect_url(config, Some(handler), None)
@@ -5409,6 +5412,7 @@ mod rust_tests {
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
+            local_addr: None,
         };
 
         let err = WebSocketClientInner::new_with_writer(config, writer)
@@ -5452,6 +5456,7 @@ mod rust_tests {
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
+            local_addr: None,
         };
 
         let result = tokio::time::timeout(
@@ -5517,6 +5522,7 @@ mod rust_tests {
             idle_timeout_ms: None,
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
+            local_addr: None,
         };
 
         let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)
@@ -5582,6 +5588,7 @@ mod rust_tests {
             idle_timeout_ms: Some(500),
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
+            local_addr: None,
         };
 
         let client = WebSocketClient::connect(config, Some(handler), None, None, vec![], None)

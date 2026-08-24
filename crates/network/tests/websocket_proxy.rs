@@ -269,6 +269,7 @@ async fn websocket_client_without_proxy_connects_directly() {
         idle_timeout_ms: None,
         backend: TransportBackend::Tungstenite,
         proxy_url: None,
+        local_addr: None,
     };
 
     let handler: MessageHandler = Arc::new(|_| {});
@@ -311,6 +312,7 @@ async fn websocket_client_invalid_proxy_error_redacts_credentials() {
         idle_timeout_ms: None,
         backend: TransportBackend::Tungstenite,
         proxy_url: Some(format!("http://proxy-user:{SECRET}@[::1")),
+        local_addr: None,
     };
 
     let handler: MessageHandler = Arc::new(|_| {});
@@ -346,6 +348,7 @@ async fn websocket_client_unreachable_proxy_error_redacts_credentials() {
         idle_timeout_ms: None,
         backend: TransportBackend::Tungstenite,
         proxy_url: Some(format!("http://{USERNAME}:{SECRET}@{proxy_addr}")),
+        local_addr: None,
     };
 
     let handler: MessageHandler = Arc::new(|_| {});

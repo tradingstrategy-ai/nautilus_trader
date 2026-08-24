@@ -611,6 +611,7 @@ impl PolymarketRtdsFeed {
                 .proxy_url
                 .as_ref()
                 .map(|url| url.expose().to_string()),
+            local_addr: None,
         }
     }
 
@@ -1401,6 +1402,7 @@ mod tests {
                     idle_timeout_ms: Some(POLYMARKET_RTDS_IDLE_TIMEOUT_MS),
                     backend: TransportBackend::default(),
                     proxy_url: None,
+                    local_addr: None,
                 },
                 Some(handler),
                 None,
