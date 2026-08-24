@@ -315,7 +315,7 @@ impl HyperliquidWebSocketClient {
             Vec::with_capacity(local_addrs.len());
         let instruments_vec: Vec<InstrumentAny> =
             self.instruments.load().values().cloned().collect();
-        let all_dex_asset_ctxs_instrument_ids = self
+        let all_dex_asset_ctxs_instrument_ids: AHashMap<Ustr, Vec<Option<InstrumentId>>> = self
             .all_dex_asset_ctxs_instrument_ids
             .load()
             .iter()
@@ -2514,6 +2514,7 @@ fn subscription_coin(subscription: &SubscriptionRequest) -> Option<Ustr> {
         | SubscriptionRequest::ActiveSpotAssetCtx { coin } => Some(*coin),
         SubscriptionRequest::ActiveAssetData { coin, .. } => Some(Ustr::from(coin.as_str())),
         SubscriptionRequest::AllMids { .. }
+        | SubscriptionRequest::AllDexsAssetCtxs
         | SubscriptionRequest::Notification { .. }
         | SubscriptionRequest::WebData2 { .. }
         | SubscriptionRequest::OrderUpdates { .. }

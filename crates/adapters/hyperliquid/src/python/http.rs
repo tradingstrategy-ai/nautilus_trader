@@ -32,8 +32,6 @@ use pyo3::{IntoPyObjectExt, prelude::*, types::PyList};
 use rust_decimal::Decimal;
 use serde_json::to_string;
 
-use std::str::FromStr;
-
 use crate::{
     common::enums::HyperliquidEnvironment,
     http::{

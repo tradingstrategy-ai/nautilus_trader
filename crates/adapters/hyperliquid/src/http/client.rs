@@ -1061,18 +1061,14 @@ impl HyperliquidHttpClient {
         let (pk_env_var, vault_env_var) =
             crate::common::credential::credential_env_vars(environment);
 
-        let resolved_pk = match private_key {
-            Some(pk) => Some(pk),
-            None => env::var(pk_env_var).ok(),
-        };
-        let resolved_vault = match vault_address {
-            Some(vault) => Some(vault),
-            None => env::var(vault_env_var).ok(),
-        };
-        let resolved_account_address = match account_address {
-            Some(addr) => Some(addr),
-            None => env::var("HYPERLIQUID_ACCOUNT_ADDRESS").ok(),
-        };
+        let resolved_account_address = resolve_execution_account_address(
+            private_key.as_deref(),
+            vault_address.as_deref(),
+            account_address.as_deref(),
+            environment,
+        )?;
+        let resolved_pk = private_key.or_else(|| std::env::var(pk_env_var).ok());
+        let resolved_vault = vault_address.or_else(|| std::env::var(vault_env_var).ok());
 
         let pool = HyperliquidRawHttpClient::make_pool_multi(timeout_secs, proxy_url, addresses)
             .map_err(|e| Error::auth(format!("Failed to build REST pool: {e}")))?;
@@ -1099,6 +1095,7 @@ impl HyperliquidHttpClient {
             account_address: resolved_account_address,
             normalize_prices: true,
             market_order_slippage_bps: crate::common::parse::DEFAULT_MARKET_SLIPPAGE_BPS,
+            include_builder_attribution: true,
         })
     }
 
