@@ -1013,16 +1013,3 @@ impl HyperliquidHttpClient {
         })
     }
 }
-
-/// Wraps [`parse_addr_list`] from `http::client`, mapping the `String` error
-/// to a `PyErr`.
-///
-/// Returns an empty Vec if the input is `None` or all entries are
-/// empty/whitespace. Returns a [`PyErr`] if any non-empty entry fails to
-/// parse as an [`std::net::IpAddr`].
-fn resolve_addr_list(
-    field_name: &str,
-    raw: &Option<Vec<String>>,
-) -> PyResult<Vec<std::net::IpAddr>> {
-    parse_addr_list(field_name, raw).map_err(to_pyvalue_err)
-}
