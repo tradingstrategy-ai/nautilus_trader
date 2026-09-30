@@ -16,6 +16,7 @@
 use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -106,6 +107,77 @@ impl WeightedLimiter {
 pub struct RateLimitSnapshot {
     pub capacity: u32,
     pub tokens: u32,
+}
+
+/// One [`WeightedLimiter`] per `HttpPool` slot.
+///
+/// Hyperliquid enforces its REST rate limit **per source IP**, so a client
+/// fanning requests across an `N`-address pool gets `N` independent 1200/min
+/// buckets rather than one bucket shared by the whole client. A 1-slot
+/// instance (the historical single-IP case) behaves identically to a single
+/// [`WeightedLimiter`] — same capacity, same wait for the same call pattern.
+///
+/// Callers must `acquire`/`debit_extra` on the SAME slot index that
+/// `HttpPool::pick_client` returned for that request, so the credit for a
+/// completed request lands on the bucket it actually drew from.
+#[derive(Debug, Clone)]
+pub struct PerSlotLimiter {
+    slots: Arc<Vec<WeightedLimiter>>,
+}
+
+impl PerSlotLimiter {
+    /// Build one [`WeightedLimiter::per_minute(capacity)`] per slot.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n_slots == 0` — a limiter fan must cover at least the
+    /// pool's single no-bind slot.
+    pub fn new(n_slots: usize, capacity: u32) -> Self {
+        assert!(n_slots > 0, "PerSlotLimiter::new called with n_slots=0");
+        let slots = (0..n_slots)
+            .map(|_| WeightedLimiter::per_minute(capacity))
+            .collect();
+        Self {
+            slots: Arc::new(slots),
+        }
+    }
+
+    /// Number of slots (buckets) in this limiter.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Whether this limiter has no slots (never true for an instance built
+    /// via [`Self::new`], which asserts `n_slots > 0`).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    /// Acquire `weight` tokens from the bucket at `slot`, sleeping until available.
+    pub async fn acquire(&self, slot: usize, weight: u32) {
+        self.slots[slot].acquire(weight).await;
+    }
+
+    /// Post-response debit for per-item adders, applied to the bucket at `slot`.
+    pub async fn debit_extra(&self, slot: usize, extra: u32) {
+        self.slots[slot].debit_extra(extra).await;
+    }
+
+    /// Snapshot the bucket at `slot`.
+    pub async fn snapshot(&self, slot: usize) -> RateLimitSnapshot {
+        self.slots[slot].snapshot().await
+    }
+
+    /// Snapshot every slot's bucket, in slot order.
+    pub async fn snapshot_all(&self) -> Vec<RateLimitSnapshot> {
+        let mut out = Vec::with_capacity(self.slots.len());
+        for limiter in self.slots.iter() {
+            out.push(limiter.snapshot().await);
+        }
+        out
+    }
 }
 
 pub fn backoff_full_jitter(attempt: u32, base: Duration, cap: Duration) -> Duration {
@@ -478,5 +550,96 @@ mod tests {
 
         let delay_high = backoff_full_jitter(10, base, cap);
         assert!(delay_high.as_millis() <= cap.as_millis());
+    }
+
+    // Per-slot limiter parallelism tests.
+    //
+    // `wait_per_call = 60 / free_calls` for a `WeightedLimiter::per_minute(capacity)`
+    // drained one token (weight 1) at a time past its `free_calls = capacity` budget.
+    // With `free_calls = 200`, `wait_per_call = 0.3s`; 4 calls beyond the free budget
+    // force a deterministic ~1.2s wait per slot. These constants keep the test fast
+    // (~1-2s) while still proving the parallelism/regression properties.
+    const TEST_CAPACITY: u32 = 200;
+    const TEST_FREE_CALLS: u32 = TEST_CAPACITY; // weight 1 per acquire
+    const TEST_EXTRA_CALLS: u32 = 4;
+    const TEST_CALLS_PER_SLOT: u32 = TEST_FREE_CALLS + TEST_EXTRA_CALLS;
+
+    #[tokio::test]
+    async fn test_per_slot_limiter_4_slots_run_in_parallel() {
+        // 4 slots, each drained by TEST_CALLS_PER_SLOT weight-1 acquires. If each
+        // slot has its own bucket, all 4 slots' waits overlap and total wall time
+        // is ~one slot's wait (~1.2s), not ~4x that (~4.8s) as it would be with a
+        // single shared bucket serving all 4 slots' worth of load.
+        let limiter = PerSlotLimiter::new(4, TEST_CAPACITY);
+
+        let t0 = std::time::Instant::now();
+        let mut handles = Vec::new();
+        for slot in 0..4 {
+            let limiter = limiter.clone();
+            handles.push(tokio::spawn(async move {
+                for _ in 0..TEST_CALLS_PER_SLOT {
+                    limiter.acquire(slot, 1).await;
+                }
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        let elapsed = t0.elapsed();
+
+        assert!(
+            elapsed.as_millis() < 2_500,
+            "Expected parallel per-slot drain to finish well under 2.5s, took {}ms",
+            elapsed.as_millis()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_per_slot_limiter_1_slot_matches_single_limiter_timing() {
+        // Regression guard: a 1-slot pool must behave byte-for-byte like the old
+        // single shared `WeightedLimiter` — same capacity, same wait for the same
+        // call pattern used by exactly one slot above.
+        let limiter = PerSlotLimiter::new(1, TEST_CAPACITY);
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..TEST_CALLS_PER_SLOT {
+            limiter.acquire(0, 1).await;
+        }
+        let elapsed = t0.elapsed();
+
+        assert!(
+            elapsed.as_millis() >= 900,
+            "Expected the single-slot limiter to pay the full refill wait (~1.2s), was {}ms",
+            elapsed.as_millis()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_per_slot_limiter_debit_extra_lands_on_same_slot() {
+        // debit_extra(slot, ..) must only affect the slot it targets, never a
+        // different slot or an aggregate shared across slots.
+        let limiter = PerSlotLimiter::new(2, 100);
+
+        limiter.acquire(0, 30).await;
+        limiter.debit_extra(0, 20).await;
+
+        let snap0 = limiter.snapshot(0).await;
+        let snap1 = limiter.snapshot(1).await;
+
+        assert_eq!(snap0.tokens, 50); // 100 - 30 - 20
+        assert_eq!(snap1.tokens, 100); // untouched
+    }
+
+    #[tokio::test]
+    async fn test_per_slot_limiter_snapshot_all_returns_one_per_slot() {
+        let limiter = PerSlotLimiter::new(3, 100);
+        limiter.acquire(1, 40).await;
+
+        let snapshots = limiter.snapshot_all().await;
+
+        assert_eq!(snapshots.len(), 3);
+        assert_eq!(snapshots[0].tokens, 100);
+        assert_eq!(snapshots[1].tokens, 60);
+        assert_eq!(snapshots[2].tokens, 100);
     }
 }

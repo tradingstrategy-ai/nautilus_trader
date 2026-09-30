@@ -142,6 +142,22 @@ impl HttpPool {
         (slot, &self.slots[slot])
     }
 
+    /// Return the [`HttpClient`] at a specific, already-chosen slot index.
+    ///
+    /// For callers that pick a slot once (e.g. to rate-limit against that
+    /// slot's own per-IP bucket) and must keep every retry of the same
+    /// logical request pinned to that slot — re-calling [`Self::pick_client`]
+    /// on retry would advance the round-robin counter and silently dispatch
+    /// the retry from a different IP than the one whose quota was charged.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `slot >= self.len()`.
+    #[must_use]
+    pub fn client_at(&self, slot: usize) -> &HttpClient {
+        &self.slots[slot]
+    }
+
     /// Round-robin dispatch. Returns `(slot_index, closure_result)`.
     ///
     /// # Safety-critical non-feature: no automatic retry on a different slot
@@ -189,8 +205,8 @@ mod tests {
 
     #[test]
     fn loopback_constructs() {
-        let pool = HttpPool::new(&loopback_template(), vec![IpAddr::V4(Ipv4Addr::LOCALHOST)])
-            .unwrap();
+        let pool =
+            HttpPool::new(&loopback_template(), vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
         assert_eq!(pool.len(), 1);
     }
 
@@ -235,8 +251,8 @@ mod tests {
 
     #[tokio::test]
     async fn closure_result_propagates() {
-        let pool = HttpPool::new(&loopback_template(), vec![IpAddr::V4(Ipv4Addr::LOCALHOST)])
-            .unwrap();
+        let pool =
+            HttpPool::new(&loopback_template(), vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
         let (slot, result) = pool
             .dispatch_async(PickHint::Stateless, |_| async { "hello" })
             .await;
@@ -246,8 +262,8 @@ mod tests {
 
     #[test]
     fn pick_client_singleton_returns_slot_0() {
-        let pool = HttpPool::new(&loopback_template(), vec![IpAddr::V4(Ipv4Addr::LOCALHOST)])
-            .unwrap();
+        let pool =
+            HttpPool::new(&loopback_template(), vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
         for _ in 0..5 {
             let (slot, _client) = pool.pick_client(PickHint::Stateless);
             assert_eq!(slot, 0);
@@ -275,10 +291,34 @@ mod tests {
     #[cfg(debug_assertions)]
     #[should_panic(expected = "HttpPool::pick_client got non-Stateless hint")]
     fn pick_client_rejects_non_stateless_hint_in_debug() {
-        let pool = HttpPool::new(&loopback_template(), vec![IpAddr::V4(Ipv4Addr::LOCALHOST)])
-            .unwrap();
+        let pool =
+            HttpPool::new(&loopback_template(), vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
         let _ = pool.pick_client(PickHint::WalletPrivateChannel {
             channel: "userFills",
         });
+    }
+
+    #[test]
+    fn client_at_returns_the_slot_pick_client_chose() {
+        // A caller that rate-limits against the slot `pick_client` returned
+        // must be able to re-fetch that exact same client on retry without
+        // advancing the round-robin counter (client_at must not rotate).
+        let pool = HttpPool::new(
+            &loopback_template(),
+            vec![
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+            ],
+        )
+        .unwrap();
+        let (slot, picked) = pool.pick_client(PickHint::Stateless);
+        let by_index = pool.client_at(slot);
+        assert!(std::ptr::eq(picked, by_index));
+
+        // Re-fetching the same slot repeatedly must not rotate the pool.
+        let _ = pool.client_at(slot);
+        let (next_slot, _) = pool.pick_client(PickHint::Stateless);
+        assert_eq!(next_slot, (slot + 1) % pool.len());
     }
 }

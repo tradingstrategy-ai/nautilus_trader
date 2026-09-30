@@ -103,7 +103,7 @@ use crate::{
         },
         query::{ExchangeAction, InfoRequest},
         rate_limits::{
-            RateLimitSnapshot, WeightedLimiter, backoff_full_jitter, exchange_weight,
+            PerSlotLimiter, RateLimitSnapshot, backoff_full_jitter, exchange_weight,
             exec_action_weight, info_base_weight, info_extra_weight,
         },
     },
@@ -188,7 +188,10 @@ pub struct HyperliquidRawHttpClient {
     signer: Option<HyperliquidEip712Signer>,
     nonce_manager: Option<Arc<NonceManager>>,
     vault_address: Option<VaultAddress>,
-    rest_limiter: Arc<WeightedLimiter>,
+    /// One [`WeightedLimiter`] bucket per `pool` slot — Hyperliquid enforces
+    /// its REST rate limit per source IP, so each pool slot needs its own
+    /// 1200/min budget rather than sharing one bucket across every IP.
+    rest_limiter: PerSlotLimiter,
     rate_limit_backoff_base: Duration,
     rate_limit_backoff_cap: Duration,
     rate_limit_max_attempts_info: u32,
@@ -232,9 +235,7 @@ impl HyperliquidRawHttpClient {
         let pool = HttpPool::new(&template, addresses).map_err(|e| match e {
             PoolError::Empty => HttpClientError::ClientBuildError("pool addresses empty".into()),
             PoolError::BindFailed { cause, .. } => HttpClientError::ClientBuildError(cause),
-            PoolError::InvalidAddress { reason, .. } => {
-                HttpClientError::ClientBuildError(reason)
-            }
+            PoolError::InvalidAddress { reason, .. } => HttpClientError::ClientBuildError(reason),
         })?;
         Ok(Arc::new(pool))
     }
@@ -260,6 +261,7 @@ impl HyperliquidRawHttpClient {
     /// an authenticated client against the same multi-IP fan).
     #[must_use]
     pub fn new_with_pool(environment: HyperliquidEnvironment, pool: Arc<HttpPool>) -> Self {
+        let rest_limiter = PerSlotLimiter::new(pool.len(), 1200);
         Self {
             pool,
             environment,
@@ -268,7 +270,7 @@ impl HyperliquidRawHttpClient {
             signer: None,
             nonce_manager: None,
             vault_address: None,
-            rest_limiter: Arc::new(WeightedLimiter::per_minute(1200)),
+            rest_limiter,
             rate_limit_backoff_base: Duration::from_millis(125),
             rate_limit_backoff_cap: Duration::from_secs(5),
             rate_limit_max_attempts_info: 3,
@@ -320,6 +322,7 @@ impl HyperliquidRawHttpClient {
         let signer = HyperliquidEip712Signer::new(&secrets.private_key)
             .map_err(|e| HttpClientError::from(e.to_string()))?;
         let nonce_manager = Arc::new(NonceManager::new());
+        let rest_limiter = PerSlotLimiter::new(pool.len(), 1200);
 
         Ok(Self {
             pool,
@@ -329,7 +332,7 @@ impl HyperliquidRawHttpClient {
             signer: Some(signer),
             nonce_manager: Some(nonce_manager),
             vault_address: secrets.vault_address,
-            rest_limiter: Arc::new(WeightedLimiter::per_minute(1200)),
+            rest_limiter,
             rate_limit_backoff_base: Duration::from_millis(125),
             rate_limit_backoff_cap: Duration::from_secs(5),
             rate_limit_max_attempts_info: 3,
@@ -405,7 +408,7 @@ impl HyperliquidRawHttpClient {
     /// Configure rate limiting parameters (chainable).
     #[must_use]
     pub fn with_rate_limits(mut self) -> Self {
-        self.rest_limiter = Arc::new(WeightedLimiter::per_minute(1200));
+        self.rest_limiter = PerSlotLimiter::new(self.pool.len(), 1200);
         self.rate_limit_backoff_base = Duration::from_millis(125);
         self.rate_limit_backoff_cap = Duration::from_secs(5);
         self.rate_limit_max_attempts_info = 3;
@@ -640,21 +643,27 @@ impl HyperliquidRawHttpClient {
 
     async fn send_info_request(&self, request: &InfoRequest) -> Result<Value> {
         let base_w = info_base_weight(request);
-        self.rest_limiter.acquire(base_w).await;
+        // Pick the pool slot ONCE per request and rate-limit on that slot's
+        // own bucket. Hyperliquid enforces its REST quota per source IP, so
+        // acquiring on a shared bucket before the slot is chosen (the old
+        // behaviour) throttled the whole multi-IP pool down to a single
+        // IP's throughput regardless of pool size.
+        let (slot, _client) = self.pool.pick_client(PickHint::Stateless);
+        self.rest_limiter.acquire(slot, base_w).await;
 
         let mut attempt = 0u32;
 
         loop {
-            let response = self.http_roundtrip_info(request).await?;
+            let response = self.http_roundtrip_info(slot, request).await?;
 
             if response.status.is_success() {
                 // decode once to count items, then materialize T
                 let val: Value = serde_json::from_slice(&response.body).map_err(Error::Serde)?;
                 let extra = info_extra_weight(request, &val);
                 if extra > 0 {
-                    self.rest_limiter.debit_extra(extra).await;
+                    self.rest_limiter.debit_extra(slot, extra).await;
                     log::debug!(
-                        "Info debited extra weight: endpoint={request:?}, base_w={base_w}, extra={extra}"
+                        "Info debited extra weight: endpoint={request:?}, slot={slot}, base_w={base_w}, extra={extra}"
                     );
                 }
                 return Ok(val);
@@ -679,13 +688,13 @@ impl HyperliquidRawHttpClient {
                         Duration::from_millis,
                     );
                 log::warn!(
-                    "429 Too Many Requests; backing off: endpoint={request:?}, attempt={attempt}, wait_ms={:?}",
+                    "429 Too Many Requests; backing off: endpoint={request:?}, slot={slot}, attempt={attempt}, wait_ms={:?}",
                     delay.as_millis()
                 );
                 attempt += 1;
                 tokio::time::sleep(delay).await;
                 // tiny re-acquire to avoid stampede exactly on minute boundary
-                self.rest_limiter.acquire(1).await;
+                self.rest_limiter.acquire(slot, 1).await;
                 continue;
             }
 
@@ -699,7 +708,7 @@ impl HyperliquidRawHttpClient {
                     self.rate_limit_backoff_cap,
                 );
                 log::warn!(
-                    "Transient error; retrying: endpoint={request:?}, attempt={attempt}, status={:?}, wait_ms={:?}",
+                    "Transient error; retrying: endpoint={request:?}, slot={slot}, attempt={attempt}, status={:?}, wait_ms={:?}",
                     response.status.as_u16(),
                     delay.as_millis()
                 );
@@ -717,14 +726,24 @@ impl HyperliquidRawHttpClient {
         }
     }
 
-    async fn http_roundtrip_info(&self, request: &InfoRequest) -> Result<HttpResponse> {
+    /// Roundtrip an Info request against the given pool `slot`.
+    ///
+    /// `slot` MUST be the index [`send_info_request`] already rate-limited
+    /// against, so the request lands on the same IP whose bucket paid for
+    /// it — never re-pick a slot here, or the acquired quota and the
+    /// dispatched IP silently diverge.
+    async fn http_roundtrip_info(
+        &self,
+        slot: usize,
+        request: &InfoRequest,
+    ) -> Result<HttpResponse> {
         let url = &self.base_info;
         let body = serde_json::to_value(request).map_err(Error::Serde)?;
         let body_bytes = serde_json::to_string(&body)
             .map_err(Error::Serde)?
             .into_bytes();
 
-        let (_slot, client) = self.pool.pick_client(PickHint::Stateless);
+        let client = self.pool.client_at(slot);
         client
             .request(
                 Method::POST,
@@ -745,7 +764,8 @@ impl HyperliquidRawHttpClient {
         action: &ExchangeAction,
     ) -> Result<HyperliquidExchangeResponse> {
         let w = exchange_weight(action);
-        self.rest_limiter.acquire(w).await;
+        let (slot, _client) = self.pool.pick_client(PickHint::Stateless);
+        self.rest_limiter.acquire(slot, w).await;
 
         let signer = self
             .signer
@@ -790,7 +810,7 @@ impl HyperliquidRawHttpClient {
             HyperliquidExchangeRequest::new(action.clone(), nonce_u64, sig)
         };
 
-        let response = self.http_roundtrip_exchange(&request).await?;
+        let response = self.http_roundtrip_exchange(slot, &request).await?;
 
         if response.status.is_success() {
             let parsed_response: HyperliquidExchangeResponse =
@@ -891,11 +911,12 @@ impl HyperliquidRawHttpClient {
         action: &HyperliquidExecAction,
     ) -> Result<HyperliquidExchangeResponse> {
         let w = exec_action_weight(action);
-        self.rest_limiter.acquire(w).await;
+        let (slot, _client) = self.pool.pick_client(PickHint::Stateless);
+        self.rest_limiter.acquire(slot, w).await;
 
         let request = self.sign_action_exec_request(action, None)?;
 
-        let response = self.http_roundtrip_exchange(&request).await?;
+        let response = self.http_roundtrip_exchange(slot, &request).await?;
 
         if response.status.is_success() {
             let parsed_response: HyperliquidExchangeResponse =
@@ -931,13 +952,23 @@ impl HyperliquidRawHttpClient {
         }
     }
 
-    /// Submit a single order to the Hyperliquid exchange.
+    /// Snapshot every pool slot's REST rate-limit bucket, in slot order.
     ///
-    pub async fn rest_limiter_snapshot(&self) -> RateLimitSnapshot {
-        self.rest_limiter.snapshot().await
+    /// One entry per `pool` slot (Hyperliquid enforces its REST quota per
+    /// source IP, so each slot tracks its own budget independently). A
+    /// single-IP pool returns a one-element `Vec`.
+    pub async fn rest_limiter_snapshot(&self) -> Vec<RateLimitSnapshot> {
+        self.rest_limiter.snapshot_all().await
     }
+
+    /// Roundtrip a signed exchange request against the given pool `slot`.
+    ///
+    /// `slot` MUST be the index the caller already rate-limited against
+    /// (see [`Self::http_roundtrip_info`] for why re-picking here would be
+    /// wrong).
     async fn http_roundtrip_exchange<T>(
         &self,
+        slot: usize,
         request: &HyperliquidExchangeRequest<T>,
     ) -> Result<HttpResponse>
     where
@@ -947,7 +978,7 @@ impl HyperliquidRawHttpClient {
         let body = serde_json::to_string(&request).map_err(Error::Serde)?;
         let body_bytes = body.into_bytes();
 
-        let (_slot, client) = self.pool.pick_client(PickHint::Stateless);
+        let client = self.pool.client_at(slot);
         let response = client
             .request(
                 Method::POST,
@@ -3861,7 +3892,7 @@ mod tests {
     use serde_json::{Value, json};
     use ustr::Ustr;
 
-    use super::{HyperliquidHttpClient, resolve_perp_dex_name};
+    use super::{HyperliquidHttpClient, parse_addr_list, resolve_perp_dex_name};
     use crate::{
         common::{
             consts::{HYPERLIQUID_VENUE, NAUTILUS_BUILDER_ADDRESS},
@@ -4673,10 +4704,7 @@ mod tests {
     fn parse_addr_list_rejects_garbage() {
         let input = Some(vec!["not.an.ip".to_string()]);
         let err = parse_addr_list("test", &input).unwrap_err();
-        assert!(
-            err.contains("Invalid test entry 'not.an.ip'"),
-            "got: {err}"
-        );
+        assert!(err.contains("Invalid test entry 'not.an.ip'"), "got: {err}");
     }
 
     #[rstest]
