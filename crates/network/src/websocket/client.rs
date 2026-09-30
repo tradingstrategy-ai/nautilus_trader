@@ -5931,6 +5931,7 @@ mod rust_tests {
             vec![],
             TransportBackend::Tungstenite,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -5976,6 +5977,7 @@ mod rust_tests {
             vec![],
             TransportBackend::Tungstenite,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -6007,6 +6009,7 @@ mod rust_tests {
             &url,
             vec![],
             TransportBackend::Tungstenite,
+            None,
             None,
         )
         .await
