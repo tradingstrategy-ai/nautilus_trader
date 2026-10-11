@@ -472,6 +472,15 @@ averages are available, and the earliest native creation timestamp as the accept
 
 #### Startup reconciliation
 
+For an intentional fresh start after closing all positions and orders, set
+`DeriveExecutionClientConfig.reconciliation_start_time_ms` to the verified flat baseline's
+UNIX millisecond timestamp. Only use this boundary with no cached execution state from before
+that timestamp. Startup, reconnect, and history report requests retain the same fixed boundary;
+current open orders and positions are always read without a time filter. Failed sources and
+missing order evidence within the retained history still fail mass-status reconciliation, even
+when a bounded lookback is also requested. A boundary in the future is rejected before querying
+history. Leave it unchanged across restarts so subsequent executions remain recoverable.
+
 Before private streaming starts, the execution client publishes account state, loads instrument
 definitions required by the native portfolio and cached active orders, and waits for the engine
 cache to observe them. It restores owned active order context from cached order events, including

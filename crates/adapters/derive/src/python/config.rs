@@ -115,6 +115,7 @@ impl DeriveExecutionClientConfig {
         max_matching_requests_per_second = None,
         max_per_instrument_matching_requests_per_second = None,
         transport_backend = None,
+        reconciliation_start_time_ms = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
@@ -140,6 +141,7 @@ impl DeriveExecutionClientConfig {
         max_matching_requests_per_second: Option<u32>,
         max_per_instrument_matching_requests_per_second: Option<u32>,
         transport_backend: Option<TransportBackend>,
+        reconciliation_start_time_ms: Option<u64>,
     ) -> Self {
         let defaults = Self::default();
 
@@ -148,6 +150,7 @@ impl DeriveExecutionClientConfig {
             wallet_address,
             session_key: session_key.map(SecretString::from),
             subaccount_id,
+            reconciliation_start_time_ms,
             base_url_rest,
             base_url_ws,
             proxy_url: proxy_url.map(SecretString::from),
