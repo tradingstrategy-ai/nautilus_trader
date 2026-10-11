@@ -529,6 +529,7 @@ impl DeriveExecutionClient {
             client_id: self.core.client_id,
             account_id: self.core.account_id,
             subaccount_id: self.credential.subaccount_id(),
+            reconciliation_start_time_ms: self.config.reconciliation_start_time_ms,
             clock: self.clock,
             dispatch_state: Arc::clone(&self.dispatch_state),
             instruments: Arc::clone(&self.instruments),
@@ -2291,6 +2292,7 @@ struct DeriveReconciliationContext {
     client_id: ClientId,
     account_id: AccountId,
     subaccount_id: u64,
+    reconciliation_start_time_ms: Option<u64>,
     clock: &'static AtomicTime,
     dispatch_state: Arc<WsDispatchState>,
     instruments: Arc<AtomicMap<InstrumentId, DeriveInstrument>>,
@@ -2299,6 +2301,24 @@ struct DeriveReconciliationContext {
 }
 
 impl DeriveReconciliationContext {
+    fn history_start(
+        &self,
+        requested_start: Option<UnixNanos>,
+        ts_now: UnixNanos,
+    ) -> anyhow::Result<Option<UnixNanos>> {
+        let Some(start_ms) = self.reconciliation_start_time_ms else {
+            return Ok(requested_start);
+        };
+        let start = UnixNanos::from_millis(start_ms);
+        anyhow::ensure!(
+            start <= ts_now,
+            "Derive reconciliation_start_time_ms is in the future",
+        );
+        Ok(Some(
+            requested_start.map_or(start, |requested| requested.max(start)),
+        ))
+    }
+
     async fn refresh_account_state(&self) -> anyhow::Result<()> {
         let value = self
             .http_client
@@ -2564,6 +2584,12 @@ impl DeriveReconciliationContext {
         cmd: &GenerateOrderStatusReports,
         normalize_history_client_order_ids: bool,
     ) -> anyhow::Result<CollectedReports<OrderStatusReport>> {
+        let mut effective_cmd = cmd.clone();
+        if !effective_cmd.open_only {
+            effective_cmd.start =
+                self.history_start(effective_cmd.start, self.clock.get_time_ns())?;
+        }
+        let cmd = &effective_cmd;
         self.ensure_order_context()?;
         self.resolve_pending_modifies(cmd.instrument_id).await?;
         let mut complete = true;
@@ -2937,8 +2963,9 @@ impl DeriveReconciliationContext {
 
     async fn generate_fill_reports(
         &self,
-        cmd: GenerateFillReports,
+        mut cmd: GenerateFillReports,
     ) -> anyhow::Result<CollectedReports<FillReport>> {
+        cmd.start = self.history_start(cmd.start, self.clock.get_time_ns())?;
         self.resolve_pending_modifies(cmd.instrument_id).await?;
         let mut complete = true;
         let mut records_complete = true;
@@ -2989,8 +3016,15 @@ impl DeriveReconciliationContext {
 
         let mut reports = Vec::with_capacity(all_trades.len());
         let mut seen_trade_ids = AHashSet::new();
+        let reset_start = self
+            .reconciliation_start_time_ms
+            .map(UnixNanos::from_millis);
 
         for trade in all_trades {
+            if reset_start.is_some_and(|start| trade.timestamp < start.as_millis() as i64) {
+                continue;
+            }
+
             if let Some(target) = venue_order_id_filter.as_deref()
                 && trade.order_id != target
             {
@@ -3107,10 +3141,12 @@ impl DeriveReconciliationContext {
         self.ensure_order_context()?;
         log::info!("Generating ExecutionMassStatus (lookback_mins={lookback_mins:?})");
 
-        let start = lookback_mins
+        let requested_start = lookback_mins
             .map(DurationNanos::try_from_mins)
             .transpose()?
             .map(|lookback| ts_now.saturating_sub(lookback));
+        let start = self.history_start(requested_start, ts_now)?;
+        let allow_partial = lookback_mins.is_some() && self.reconciliation_start_time_ms.is_none();
 
         let open_order_cmd = GenerateOrderStatusReports::new(
             UUID4::new(),
@@ -3144,8 +3180,8 @@ impl DeriveReconciliationContext {
             self.generate_fill_reports(fill_cmd),
             self.generate_position_status_snapshot(&position_cmd),
         );
-        let history = collect_mass_reports(history, "order history", start.is_some())?;
-        let open = collect_mass_reports(open, "open orders", start.is_some())?;
+        let history = collect_mass_reports(history, "order history", allow_partial)?;
+        let open = collect_mass_reports(open, "open orders", allow_partial)?;
 
         let fills = match fills {
             Err(e)
@@ -3158,14 +3194,14 @@ impl DeriveReconciliationContext {
             {
                 return Err(e);
             }
-            other => collect_mass_reports(other, "fill history", start.is_some())?,
+            other => collect_mass_reports(other, "fill history", allow_partial)?,
         };
 
         let positions_complete = positions.is_ok();
 
         let position_snapshot = match positions {
             Ok(snapshot) => snapshot,
-            Err(e) if start.is_some() && e.is::<DeriveHttpError>() => {
+            Err(e) if allow_partial && e.is::<DeriveHttpError>() => {
                 log::warn!("Derive position source failed: {e:#}");
 
                 PositionStatusSnapshot {
@@ -3216,8 +3252,13 @@ impl DeriveReconciliationContext {
         }
 
         anyhow::ensure!(
-            start.is_some() || records_complete,
-            "incomplete unbounded Derive report coverage"
+            allow_partial || records_complete,
+            "incomplete {} Derive report coverage",
+            if self.reconciliation_start_time_ms.is_some() {
+                "reset"
+            } else {
+                "unbounded"
+            },
         );
 
         let detached_history_order_ids: AHashSet<VenueOrderId> = history_order_reports
