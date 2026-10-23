@@ -19,6 +19,7 @@ use std::{fmt::Debug, future::Future, pin::Pin};
 
 use anyhow::Context;
 use async_trait::async_trait;
+use indexmap::IndexMap;
 use nautilus_core::{DurationNanos, Params, UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_model::{
     accounts::AccountAny,
@@ -116,6 +117,24 @@ pub trait ExecutionClient {
     /// or missing-order resolution is enabled.
     fn retain_unresolved_submissions(&self) -> bool {
         false
+    }
+
+    /// Returns venue order ID histories for startup reconciliation, keyed by client order ID.
+    ///
+    /// Each history covers one proven logical order: at least two IDs, oldest first and current last.
+    ///
+    /// - Reports share a client order ID and exclude cached orders and indexed venue IDs.
+    /// - Previous reports are closed and contribute only fills and ID history.
+    /// - The current report is open, with logical quantity and cumulative fills.
+    /// - Its acceptance time is no later than any fill in the history.
+    ///
+    /// The live execution manager consumes these histories. Defaults to `None`; overrides must not
+    /// change client state.
+    fn venue_order_ids(
+        &self,
+        _mass_status: &ExecutionMassStatus,
+    ) -> Option<IndexMap<ClientOrderId, Vec<VenueOrderId>>> {
+        None
     }
 
     /// Returns the maximum absolute position difference tolerated during reconciliation.
@@ -240,7 +259,7 @@ pub trait ExecutionClient {
     ///
     /// Returns an error if submission fails.
     fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), &cmd);
         Ok(())
     }
 
@@ -250,7 +269,7 @@ pub trait ExecutionClient {
     ///
     /// Returns an error if submission fails.
     fn submit_order_list(&self, cmd: SubmitOrderList) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), &cmd);
         Ok(())
     }
 
@@ -260,7 +279,7 @@ pub trait ExecutionClient {
     ///
     /// Returns an error if modification fails.
     fn modify_order(&self, cmd: ModifyOrder) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), &cmd);
         Ok(())
     }
 
@@ -285,7 +304,7 @@ pub trait ExecutionClient {
     ///
     /// Returns an error if cancellation fails.
     fn cancel_order(&self, cmd: CancelOrder) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), &cmd);
         Ok(())
     }
 
@@ -295,7 +314,7 @@ pub trait ExecutionClient {
     ///
     /// Returns an error if cancellation fails.
     fn cancel_all_orders(&self, cmd: CancelAllOrders) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), &cmd);
         Ok(())
     }
 
@@ -305,7 +324,7 @@ pub trait ExecutionClient {
     ///
     /// Returns an error if batch cancellation fails.
     fn batch_cancel_orders(&self, cmd: BatchCancelOrders) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), &cmd);
         Ok(())
     }
 
@@ -315,7 +334,7 @@ pub trait ExecutionClient {
     ///
     /// Returns an error if the query fails.
     fn query_account(&self, cmd: QueryAccount) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), &cmd);
         Ok(())
     }
 
@@ -325,7 +344,7 @@ pub trait ExecutionClient {
     ///
     /// Returns an error if the query fails.
     fn query_order(&self, cmd: QueryOrder) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), &cmd);
         Ok(())
     }
 
@@ -349,7 +368,7 @@ pub trait ExecutionClient {
         &self,
         cmd: &GenerateOrderStatusReport,
     ) -> anyhow::Result<Option<OrderStatusReport>> {
-        log_not_implemented(cmd);
+        log_not_implemented(self.client_id(), cmd);
         Ok(None)
     }
 
@@ -370,7 +389,7 @@ pub trait ExecutionClient {
         &self,
         cmd: &GenerateOrderStatusReports,
     ) -> anyhow::Result<Vec<OrderStatusReport>> {
-        log_not_implemented(cmd);
+        log_not_implemented(self.client_id(), cmd);
         Ok(Vec::new())
     }
 
@@ -391,7 +410,7 @@ pub trait ExecutionClient {
         &self,
         cmd: GenerateFillReports,
     ) -> anyhow::Result<Vec<FillReport>> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), &cmd);
         Ok(Vec::new())
     }
 
@@ -412,7 +431,7 @@ pub trait ExecutionClient {
         &self,
         cmd: &GeneratePositionStatusReports,
     ) -> anyhow::Result<Vec<PositionStatusReport>> {
-        log_not_implemented(cmd);
+        log_not_implemented(self.client_id(), cmd);
         Ok(Vec::new())
     }
 

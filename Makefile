@@ -204,7 +204,7 @@ CORE_SELECTED_FEATURES := $(subst $(space),$(comma),$(strip $(CORE_SELECTED_FEAT
 STANDARD_PRECISION_ARGS := --workspace --exclude nautilus-blockchain --no-default-features --lib --tests --features "ffi,python"
 SIM_PACKAGES := -p nautilus-common -p nautilus-core -p nautilus-event-store \
 	-p nautilus-network -p nautilus-execution -p nautilus-live
-SIM_ADAPTER_PACKAGES := -p nautilus-okx -p nautilus-derive
+SIM_ADAPTER_PACKAGES := -p nautilus-okx -p nautilus-coinapi -p nautilus-derive
 SIM_FILTERSET := package(nautilus-common) + package(nautilus-event-store) + \
 	package(nautilus-network) + \
 	package(nautilus-execution) + \
@@ -227,7 +227,7 @@ CARGO_BUILD_JOB_TARGETS := install install-debug build build-debug build-wheel p
 	check-code-sim check-code-standard-precision \
 	check-all-targets clippy clippy-fix clippy-fix-nightly clippy-pedantic-crate-% \
 	clippy-strict-audit \
-	docs docs-rust docsrs-check cargo-build cargo-check check-features check-features-defi \
+	docs docs-rust check-docsrs cargo-build cargo-check check-features check-features-defi \
 	hawk cargo-test \
 	cargo-test-extras cargo-test-postgres-ci cargo-test-doc cargo-test-core-local cargo-test-core-selected \
 	cargo-test-core cargo-test-adapters cargo-test-sim cargo-test-core-debug \
@@ -273,7 +273,7 @@ CORE_CRATES := nautilus-analysis nautilus-backtest nautilus-common nautilus-core
 # Crates tested in the workspace-compiled adapter lane
 ADAPTER_CRATES := nautilus-architect-ax nautilus-betfair nautilus-binance \
     nautilus-blockchain nautilus-bybit nautilus-cli \
-    nautilus-coinbase nautilus-databento nautilus-deribit nautilus-derive \
+    nautilus-coinapi nautilus-coinbase nautilus-databento nautilus-deribit nautilus-derive \
     nautilus-dydx nautilus-hyperliquid nautilus-interactive-brokers \
     nautilus-kraken nautilus-lighter nautilus-okx nautilus-polymarket \
     nautilus-sandbox nautilus-tardis
@@ -656,10 +656,10 @@ docs-rust: export RUSTDOCFLAGS=--enable-index-page -Zunstable-options $(if $(RUS
 docs-rust: check-cargo-cooldown  #-- Build Rust documentation with cargo doc
 	cargo +nightly doc --locked --all-features --no-deps --workspace
 
-.PHONY: docsrs-check
-docsrs-check: export DOCS_RS=1
-docsrs-check: export RUSTDOCFLAGS=--cfg docsrs -D warnings
-docsrs-check: check-cargo-cooldown check-hack-installed #-- Check documentation builds for docs.rs compatibility
+.PHONY: check-docsrs
+check-docsrs: export DOCS_RS=1
+check-docsrs: export RUSTDOCFLAGS=--cfg docsrs -D warnings
+check-docsrs: check-cargo-cooldown check-hack-installed #-- Check documentation builds for docs.rs compatibility
 	cargo +$(DOCSRS_TOOLCHAIN) hack --workspace --ignore-private --ignore-unknown-features \
 		--features arrow,arrow-display,capnp,cloud,defi \
 		--features example-databento,examples,ffi,high-precision,host \
@@ -701,8 +701,8 @@ LYCHEE_FLAGS = \
 	--max-concurrency 10 \
 	--accept "100..=103,200..=299,429,502..=504"
 
-.PHONY: docs-check-links
-docs-check-links:  #-- Check for broken links in documentation (periodic audit)
+.PHONY: check-docs-links
+check-docs-links:  #-- Check for broken links in documentation (periodic audit)
 	$(info $(M) Checking documentation links...)
 	@git ls-files -- '*.rs' ':(exclude)patches/**' \
 		| python3 -B scripts/extract-doc-links.py $(DOC_LINKS)
@@ -918,6 +918,7 @@ test-scripts:  #-- Run repository script tests
 	$Q bash scripts/ci/test-check-docker-toolchain-pins.bash
 	$Q bash scripts/ci/test-check-miri-toolchain.bash
 	$Q bash scripts/ci/test-check-nightly-merge-status.bash
+	$Q bash scripts/ci/test-check-python-result.bash
 	$Q bash scripts/ci/test-check-workspace-test-coverage.bash
 	$Q bash scripts/ci/test-configure-r2-aws.bash
 	$Q bash scripts/ci/test-docker-workflow-scripts.bash

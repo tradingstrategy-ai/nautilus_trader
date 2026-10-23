@@ -46,6 +46,7 @@ use nautilus_model::{
     types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
 };
 use nautilus_network::{
+    ConnectionUrl,
     http::{
         HttpClient, HttpRedirectPolicy, HttpResponse, Method, create_standard_nautilus_headers,
     },
@@ -65,7 +66,8 @@ use crate::{
         credential::KrakenCredential,
         enums::{
             KrakenApiResult, KrakenEnvironment, KrakenFuturesOrderStatus, KrakenFuturesOrderType,
-            KrakenOrderSide, KrakenProductType, KrakenSendStatus, KrakenTriggerSignal,
+            KrakenFuturesQtyMode, KrakenOrderSide, KrakenProductType, KrakenSendStatus,
+            KrakenTriggerSignal, product_type_from_symbol,
         },
         parse::{
             bar_type_to_futures_resolution, normalize_asset_key, parse_bar,
@@ -78,6 +80,7 @@ use crate::{
     },
     http::{
         apply_count_limit,
+        coverage::ReportCoverage,
         error::{
             KrakenBatchOrderError, KrakenHttpError, KrakenModifyOrderError, KrakenSubmitOrderError,
             kraken_http_should_retry,
@@ -106,7 +109,7 @@ const NEXT_CONTINUATION_TOKEN_HEADER: &str = "Next-Continuation-Token";
 /// This client handles request/response operations with the Kraken Futures API,
 /// returning venue-specific response types. It does not parse to Nautilus domain types.
 pub struct KrakenFuturesRawHttpClient {
-    base_url: String,
+    base_url: ConnectionUrl,
     client: HttpClient,
     credential: Option<KrakenCredential>,
     retry_manager: RetryManager<KrakenHttpError>,
@@ -171,7 +174,7 @@ impl KrakenFuturesRawHttpClient {
         });
 
         Ok(Self {
-            base_url,
+            base_url: base_url.into(),
             client: HttpClient::builder()
                 .headers(Self::default_headers())
                 .header_keys(vec![NEXT_CONTINUATION_TOKEN_HEADER.to_string()])
@@ -220,7 +223,7 @@ impl KrakenFuturesRawHttpClient {
         });
 
         Ok(Self {
-            base_url,
+            base_url: base_url.into(),
             client: HttpClient::builder()
                 .redirect_policy(HttpRedirectPolicy::Reject)
                 .headers(Self::default_headers())
@@ -249,7 +252,7 @@ impl KrakenFuturesRawHttpClient {
 
     /// Returns the base URL for this client.
     pub fn base_url(&self) -> &str {
-        &self.base_url
+        self.base_url.expose()
     }
 
     /// Returns the credential for this client, if set.
@@ -343,9 +346,9 @@ impl KrakenFuturesRawHttpClient {
                         KrakenHttpError::AuthenticationError(format!("Failed to sign request: {e}"))
                     })?;
 
-                    let base_url = &self.base_url;
                     log::debug!(
-                        "Kraken Futures auth: endpoint={endpoint}, nonce={nonce}, base_url={base_url}"
+                        "Kraken Futures auth: endpoint={endpoint}, nonce={nonce}, base_url={}",
+                        self.base_url.origin()
                     );
 
                     headers.insert("APIKey".to_string(), cred.api_key().to_string());
@@ -367,7 +370,12 @@ impl KrakenFuturesRawHttpClient {
                         Some(rate_limit_keys),
                     )
                     .await
-                    .map_err(|e| KrakenHttpError::NetworkError(e.to_string()))?;
+                    .map_err(|e| {
+                        KrakenHttpError::NetworkError(format!(
+                            "Request to {} failed: {e}",
+                            self.base_url.origin()
+                        ))
+                    })?;
 
                 let status = response.status.as_u16();
                 if status >= 400 {
@@ -477,7 +485,12 @@ impl KrakenFuturesRawHttpClient {
                 Some(rate_limit_keys),
             )
             .await
-            .map_err(|e| KrakenHttpError::NetworkError(e.to_string()))?;
+            .map_err(|e| {
+                KrakenHttpError::NetworkError(format!(
+                    "Request to {} failed: {e}",
+                    self.base_url.origin()
+                ))
+            })?;
 
         let status = response.status.as_u16();
         if status >= 400 {
@@ -569,7 +582,7 @@ impl KrakenFuturesRawHttpClient {
                 KrakenHttpError::RequestNotStarted(format!("Failed to sign request: {e}"))
             })?;
 
-        let url = format!("{}{endpoint}", self.base_url);
+        let url = format!("{}{endpoint}", self.base_url.expose());
         let mut headers = Self::default_headers();
         headers.insert(
             "Content-Type".to_string(),
@@ -654,7 +667,9 @@ impl KrakenFuturesRawHttpClient {
                 }
             }
             response = &mut request => response
-                .map_err(|e| KrakenHttpError::NetworkError(e.to_string())),
+                .map_err(|e| KrakenHttpError::NetworkError(
+                    format!("Request to {} failed: {e}", self.base_url.origin())
+                )),
         }
     }
 
@@ -663,7 +678,7 @@ impl KrakenFuturesRawHttpClient {
         &self,
     ) -> anyhow::Result<FuturesInstrumentsResponse, KrakenHttpError> {
         let endpoint = "/derivatives/api/v3/instruments";
-        let url = format!("{}{endpoint}", self.base_url);
+        let url = format!("{}{endpoint}", self.base_url.expose());
 
         self.send_request(Method::GET, endpoint, url, false).await
     }
@@ -671,7 +686,7 @@ impl KrakenFuturesRawHttpClient {
     /// Requests ticker information for all futures instruments.
     pub async fn get_tickers(&self) -> anyhow::Result<FuturesTickersResponse, KrakenHttpError> {
         let endpoint = "/derivatives/api/v3/tickers";
-        let url = format!("{}{endpoint}", self.base_url);
+        let url = format!("{}{endpoint}", self.base_url.expose());
 
         self.send_request(Method::GET, endpoint, url, false).await
     }
@@ -682,7 +697,7 @@ impl KrakenFuturesRawHttpClient {
         symbol: &str,
     ) -> anyhow::Result<FuturesOrderBookResponse, KrakenHttpError> {
         let endpoint = format!("/derivatives/api/v3/orderbook?symbol={symbol}");
-        let url = format!("{}{endpoint}", self.base_url);
+        let url = format!("{}{endpoint}", self.base_url.expose());
 
         self.send_request(Method::GET, &endpoint, url, false).await
     }
@@ -693,7 +708,7 @@ impl KrakenFuturesRawHttpClient {
         symbol: &str,
     ) -> anyhow::Result<FuturesHistoricalFundingRatesResponse, KrakenHttpError> {
         let endpoint = format!("/derivatives/api/v4/historicalfundingrates?symbol={symbol}");
-        let url = format!("{}{endpoint}", self.base_url);
+        let url = format!("{}{endpoint}", self.base_url.expose());
 
         self.send_request(Method::GET, &endpoint, url, false).await
     }
@@ -709,7 +724,7 @@ impl KrakenFuturesRawHttpClient {
     ) -> anyhow::Result<FuturesCandlesResponse, KrakenHttpError> {
         let endpoint = format!("/api/charts/v1/{tick_type}/{symbol}/{resolution}");
 
-        let mut url = format!("{}{endpoint}", self.base_url);
+        let mut url = format!("{}{endpoint}", self.base_url.expose());
 
         let mut query_params = Vec::new();
 
@@ -740,7 +755,7 @@ impl KrakenFuturesRawHttpClient {
     ) -> anyhow::Result<FuturesPublicExecutionsResponse, KrakenHttpError> {
         let endpoint = format!("/api/history/v3/market/{symbol}/executions");
 
-        let mut url = format!("{}{endpoint}", self.base_url);
+        let mut url = format!("{}{endpoint}", self.base_url.expose());
 
         let mut query_params = Vec::new();
 
@@ -779,7 +794,7 @@ impl KrakenFuturesRawHttpClient {
         }
 
         let endpoint = "/derivatives/api/v3/openorders";
-        let url = format!("{}{endpoint}", self.base_url);
+        let url = format!("{}{endpoint}", self.base_url.expose());
 
         self.send_request(Method::GET, endpoint, url, true).await
     }
@@ -812,12 +827,18 @@ impl KrakenFuturesRawHttpClient {
             query_params.push(format!("continuation_token={token}"));
         }
 
+        // A page that hands back a continuation token must hold the newest events, which the
+        // single-order lookup relies on to tell how far back the page reaches, so the order is
+        // pinned rather than left to the venue default
+        query_params.push("sort=desc".to_string());
+
         // Build URL with query params
         let query_string = query_params.join("&");
+
         let url = if query_string.is_empty() {
-            format!("{}{endpoint}", self.base_url)
+            format!("{}{endpoint}", self.base_url.expose())
         } else {
-            format!("{}{endpoint}?{query_string}", self.base_url)
+            format!("{}{endpoint}?{query_string}", self.base_url.expose())
         };
 
         // For signing: query params go in postData, not endpoint
@@ -897,9 +918,9 @@ impl KrakenFuturesRawHttpClient {
             .unwrap_or_default();
 
         let url = if query_string.is_empty() {
-            format!("{}{endpoint}", self.base_url)
+            format!("{}{endpoint}", self.base_url.expose())
         } else {
-            format!("{}{endpoint}?{query_string}", self.base_url)
+            format!("{}{endpoint}?{query_string}", self.base_url.expose())
         };
 
         // Query params go in postData for signing
@@ -917,7 +938,7 @@ impl KrakenFuturesRawHttpClient {
         }
 
         let endpoint = "/derivatives/api/v3/openpositions";
-        let url = format!("{}{endpoint}", self.base_url);
+        let url = format!("{}{endpoint}", self.base_url.expose());
 
         self.send_request(Method::GET, endpoint, url, true).await
     }
@@ -931,7 +952,7 @@ impl KrakenFuturesRawHttpClient {
         }
 
         let endpoint = "/derivatives/api/v3/accounts";
-        let url = format!("{}{endpoint}", self.base_url);
+        let url = format!("{}{endpoint}", self.base_url.expose());
 
         self.send_request(Method::GET, endpoint, url, true).await
     }
@@ -1758,14 +1779,19 @@ impl KrakenFuturesHttpClient {
             .map(|(reports, _)| reports)
     }
 
-    /// Requests order status reports, also reporting whether the set is complete.
+    /// Requests order status reports, also reporting what the read covered.
     ///
-    /// An in-scope open order whose instrument cannot be resolved fails the read. The flag is
-    /// `false` when a record cannot be parsed, a historical record's instrument cannot be
-    /// resolved, a history row could not be represented, or the history page hands back a
-    /// continuation token: the read takes one page, since every Kraken `/history` endpoint draws
-    /// on one pool of 100 tokens, replenished at 100 every 10 minutes, at a token per page.
-    /// `ExecutionMassStatus::set_report_window` records the flag for bounded history.
+    /// An in-scope open order whose instrument cannot be resolved, or that cannot be parsed, fails
+    /// the read, except an untouched reduce-only trigger listed without an unfilled size that no
+    /// open position sizes, which is skipped, and an order a read scoped to one instrument cannot
+    /// resolve, which may be on another instrument and is skipped. The coverage records each such
+    /// skip, each history row that cannot be parsed, resolved or represented, and a continuation
+    /// token, which cuts the read short at the page's oldest event: the read takes one page, since
+    /// every Kraken `/history` endpoint draws on one pool of 100 tokens, replenished at 100 every
+    /// 10 minutes, at a token per page. A read scoped to an unheld futures instrument reads nothing
+    /// and rules out no order. `ExecutionMassStatus::set_report_window` records whether it is
+    /// complete for bounded history, and the single-order lookup whether it rules out an order it
+    /// did not return.
     pub(crate) async fn request_order_status_reports_checked(
         &self,
         account_id: AccountId,
@@ -1773,17 +1799,22 @@ impl KrakenFuturesHttpClient {
         start: Option<Timestamp>,
         end: Option<Timestamp>,
         open_only: bool,
-    ) -> anyhow::Result<(Vec<OrderStatusReport>, bool)> {
-        let mut complete = true;
+    ) -> anyhow::Result<(Vec<OrderStatusReport>, ReportCoverage)> {
+        let mut coverage = ReportCoverage::default();
 
         // A scoped read for an instrument this client does not hold can match nothing, so
-        // return before the request rather than reporting every instrument's rows.
+        // return before the request rather than reporting every instrument's rows. A spot
+        // instrument names none of this client's orders, so that read is complete; a futures one
+        // the listing lacks read nothing, so it rules out none of its orders.
         if let Some(ref target_id) = instrument_id
             && self
                 .get_cached_instrument(&target_id.symbol.inner())
                 .is_none()
         {
-            return Ok((Vec::new(), complete));
+            if product_type_from_symbol(target_id.symbol.as_str()) == KrakenProductType::Futures {
+                coverage.truncate(None);
+            }
+            return Ok((Vec::new(), coverage));
         }
         let ts_init = self.generate_ts_init();
         let mut all_reports = Vec::new();
@@ -1807,39 +1838,46 @@ impl KrakenFuturesHttpClient {
             .any(|order| order.unfilled_size.is_none())
         {
             match self.inner.get_open_positions().await {
-                Ok(response) if response.result == KrakenApiResult::Success => response
+                Ok(response) if response.result == KrakenApiResult::Success => Ok(response
                     .open_positions
                     .into_iter()
                     .map(|position| (position.symbol, position.size))
-                    .collect::<AHashMap<_, _>>(),
+                    .collect::<AHashMap<_, _>>()),
                 Ok(response) => {
-                    let error = response
+                    let reason = response
                         .error
                         .unwrap_or_else(|| "Unknown error".to_string());
-                    log::warn!("Failed to get open positions for order quantities: {error}");
-                    AHashMap::new()
+                    log::warn!("Failed to get open positions for order quantities: {reason}");
+                    Err(reason)
                 }
                 Err(e) => {
                     log::warn!("Failed to get open positions for order quantities: {e}");
-                    AHashMap::new()
+                    Err(e.to_string())
                 }
             }
         } else {
-            AHashMap::new()
+            Ok(AHashMap::new())
         };
+        let mut skipped_open_order_ids = AHashSet::new();
 
         for order in &response.open_orders {
             // Resolve the row and compare instrument ids, so a scoped read cannot match on a
             // spelling and cannot fall through to every instrument when the id is not held.
             let resolved = self.get_instrument_by_raw_symbol(&order.symbol);
-            if let Some(ref target_id) = instrument_id
-                && resolved.as_ref().is_none_or(|inst| inst.id() != *target_id)
-            {
-                continue;
+            if let Some(ref target_id) = instrument_id {
+                match &resolved {
+                    Some(inst) if inst.id() != *target_id => continue,
+                    // Unresolved, the row may be the scoped instrument's own
+                    None => {
+                        coverage.skip(&order.order_id);
+                        continue;
+                    }
+                    Some(_) => {}
+                }
             }
 
             if let Some(instrument) = resolved {
-                let position_size = if order.unfilled_size.is_none()
+                let sized_by_position = order.unfilled_size.is_none()
                     && matches!(
                         order.order_type,
                         KrakenFuturesOrderType::Stop
@@ -1848,27 +1886,51 @@ impl KrakenFuturesHttpClient {
                             | KrakenFuturesOrderType::TakeProfit
                     )
                     && order.status == KrakenFuturesOrderStatus::Untouched
-                    && order.reduce_only == Some(true)
-                {
-                    position_sizes.get(&order.symbol).copied()
-                } else {
-                    None
+                    && order.reduce_only == Some(true);
+                let position_size = match &position_sizes {
+                    Ok(sizes) if sized_by_position => sizes.get(&order.symbol).copied(),
+                    _ => None,
                 };
 
-                match parse_futures_order_status_report(
+                // Such a trigger has no size of its own until it fires. With no open position on
+                // its contract it has none to report, and failing would fail every unscoped
+                // futures order read while it rests, so it is skipped, its history rows with it;
+                // a failed positions read leaves its size unknown instead, which fails the read.
+                if sized_by_position && position_size.is_none() {
+                    if let Err(reason) = &position_sizes {
+                        anyhow::bail!(
+                            "OpenOrders: futures order {} lists no unfilled size and the open \
+                             positions read failed: {reason}",
+                            order.order_id
+                        );
+                    }
+                    log::warn!(
+                        "Skipping futures order {} on {}: the venue lists no unfilled size and no \
+                         open position sizes it; the set is incomplete",
+                        order.order_id,
+                        order.symbol
+                    );
+                    coverage.skip(&order.order_id);
+                    skipped_open_order_ids.insert(VenueOrderId::new(order.order_id.as_str()));
+                    continue;
+                }
+
+                // An in-scope open order the client cannot parse fails the read: dropped, it reads
+                // to reconciliation as an order the venue does not have.
+                let report = parse_futures_order_status_report(
                     order,
                     &instrument,
                     account_id,
                     position_size,
                     ts_init,
-                ) {
-                    Ok(report) => all_reports.push(report),
-                    Err(e) => {
-                        let order_id = &order.order_id;
-                        log::warn!("Failed to parse futures order {order_id}: {e}");
-                        complete = false;
-                    }
-                }
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "OpenOrders: failed to parse futures order {}: {e}",
+                        order.order_id
+                    )
+                })?;
+                all_reports.push(report);
             } else {
                 // An in-scope open order the client cannot resolve fails the read, as the spot
                 // client's does: dropped, it reads to reconciliation as an order the venue never had.
@@ -1903,15 +1965,24 @@ impl KrakenFuturesHttpClient {
                 log::warn!(
                     "Order history window since={start_ms:?} before={end_ms:?} holds more events than one page; the events beyond it are not read, marking the set incomplete"
                 );
-                complete = false;
+                // The page holds the newest events, so it covers every event from its oldest one
+                // on; a page with no usable event time covers nothing it can place.
+                coverage.truncate(
+                    response
+                        .oldest_event_ms
+                        .and_then(UnixNanos::from_millis_checked),
+                );
             }
 
             // The history lists every lifecycle event, so an order appears once per event. Each
             // report reconciles against the same cached state, so the read hands back one report
             // per order: the open-order snapshot when the venue still lists it, else the latest
-            // history state.
-            let open_order_ids: AHashSet<VenueOrderId> =
-                all_reports.iter().map(|r| r.venue_order_id).collect();
+            // history state. An open order the snapshot skips is not reported from its history.
+            let open_order_ids: AHashSet<VenueOrderId> = all_reports
+                .iter()
+                .map(|r| r.venue_order_id)
+                .chain(skipped_open_order_ids.iter().copied())
+                .collect();
             let mut latest: IndexMap<VenueOrderId, OrderStatusReport> = IndexMap::new();
 
             if response.skipped_rows > 0 {
@@ -1919,7 +1990,14 @@ impl KrakenFuturesHttpClient {
                     "Order history page had {} row(s) the adapter could not represent; marking the set incomplete",
                     response.skipped_rows
                 );
-                complete = false;
+
+                for order_id in &response.skipped_order_ids {
+                    coverage.skip(order_id);
+                }
+
+                if response.skipped_rows > response.skipped_order_ids.len() {
+                    coverage.skip_unidentified();
+                }
             }
 
             for event_wrapper in response.order_events {
@@ -1928,10 +2006,16 @@ impl KrakenFuturesHttpClient {
                 // Resolve the row and compare instrument ids, so a scoped read cannot match on a
                 // spelling and cannot fall through to every instrument when the id is not held.
                 let resolved = self.get_instrument_by_history_tradeable(&event.symbol);
-                if let Some(ref target_id) = instrument_id
-                    && resolved.as_ref().is_none_or(|inst| inst.id() != *target_id)
-                {
-                    continue;
+                if let Some(ref target_id) = instrument_id {
+                    match &resolved {
+                        Some(inst) if inst.id() != *target_id => continue,
+                        // Unresolved, the row may be the scoped instrument's own
+                        None => {
+                            coverage.skip(&event.order_id);
+                            continue;
+                        }
+                        Some(_) => {}
+                    }
                 }
 
                 if let Some(instrument) = resolved {
@@ -1957,7 +2041,7 @@ impl KrakenFuturesHttpClient {
                         Err(e) => {
                             let order_id = &event.order_id;
                             log::warn!("Failed to parse futures order event {order_id}: {e}");
-                            complete = false;
+                            coverage.skip(order_id);
                         }
                     }
                 } else {
@@ -1965,14 +2049,14 @@ impl KrakenFuturesHttpClient {
                         "Instrument not in cache for futures symbol {}, skipping order event",
                         event.symbol
                     );
-                    complete = false;
+                    coverage.skip(&event.order_id);
                 }
             }
 
             all_reports.extend(latest.into_values());
         }
 
-        Ok((all_reports, complete))
+        Ok((all_reports, coverage))
     }
 
     /// Requests order status reports from the venue's `/orders/status`
@@ -2049,7 +2133,8 @@ impl KrakenFuturesHttpClient {
 
     /// Requests fill reports, also reporting whether the set is complete.
     ///
-    /// See [`Self::request_order_status_reports_checked`] for what the flag means.
+    /// The flag is `false` when an in-scope fill cannot be resolved or parsed, which
+    /// `ExecutionMassStatus::set_report_window` records for bounded history.
     pub(crate) async fn request_fill_reports_checked(
         &self,
         account_id: AccountId,
@@ -2941,8 +3026,11 @@ impl KrakenFuturesHttpClient {
             builder.cli_ord_id(id.clone());
         }
 
+        // A Nautilus quantity is the order's total, fills included, while the venue reads a bare
+        // size as the open size
         if let Some(qty) = quantity {
             builder.size(qty.to_string());
+            builder.qty_mode(KrakenFuturesQtyMode::Absolute);
         }
 
         if let Some(p) = price {
@@ -3285,7 +3373,7 @@ fn parse_cash_account_balances(account: &FuturesAccount, balances: &mut AmountsB
 /// open state stamped later, such as a refused edit logged after a cancel, describes the order as
 /// it stood before it closed. Between two states of the same kind the later `ts_last` wins, and on
 /// a tie, which the venue's millisecond stamps allow, the larger filled quantity.
-fn supersedes(candidate: &OrderStatusReport, existing: &OrderStatusReport) -> bool {
+pub(crate) fn supersedes(candidate: &OrderStatusReport, existing: &OrderStatusReport) -> bool {
     match (
         candidate.order_status.is_closed(),
         existing.order_status.is_closed(),
@@ -4319,7 +4407,7 @@ mod tests {
         let client = history_test_client(history, header_token).await;
         cache_test_futures_instrument(&client);
 
-        let (reports, complete) = client
+        let (reports, coverage) = client
             .request_order_status_reports_checked(
                 AccountId::from("KRAKEN-001"),
                 None,
@@ -4330,7 +4418,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(complete, expected_complete);
+        assert_eq!(coverage.is_complete(), expected_complete);
         assert_eq!(
             reports
                 .iter()
@@ -4339,6 +4427,48 @@ mod tests {
             vec!["H-SKIP-1", "H-KEEP-2"],
             "the page's rows are reported either way"
         );
+    }
+
+    /// An edit that resizes the order sends its size as the order's total, fills included, since
+    /// the venue reads a bare size as the open size, on the single and the batch edit alike; a
+    /// price-only edit sends no size and no mode.
+    #[rstest]
+    #[case::resize(Some("5"), Some("ABSOLUTE"))]
+    #[case::price_only(None, None)]
+    #[tokio::test]
+    async fn test_build_edit_order_params_sends_a_size_as_the_total(
+        #[case] size: Option<&str>,
+        #[case] expected_qty_mode: Option<&str>,
+    ) {
+        let client = history_test_client(Arc::new(RwLock::new(String::new())), None).await;
+        let instrument_id = cache_test_futures_instrument(&client);
+
+        let params = client
+            .build_edit_order_params(
+                instrument_id,
+                None,
+                Some(VenueOrderId::from("V-EDIT-1")),
+                size.map(Quantity::from),
+                Some(Price::from("70000")),
+                None,
+            )
+            .unwrap();
+
+        let form: Vec<(String, String)> =
+            serde_urlencoded::from_str(&serde_urlencoded::to_string(&params).unwrap()).unwrap();
+        let form_field = |name: &str| {
+            form.iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(form_field("size"), size, "{form:?}");
+        assert_eq!(form_field("qtyMode"), expected_qty_mode, "{form:?}");
+
+        let item =
+            serde_json::to_value(KrakenFuturesBatchEditItem::from_params(params, "tag-1")).unwrap();
+        let item_field = |name: &str| item.get(name).and_then(|value| value.as_str());
+        assert_eq!(item_field("size"), size, "{item}");
+        assert_eq!(item_field("qtyMode"), expected_qty_mode, "{item}");
     }
 
     /// A closed order does not reopen: a refused edit logged after the cancel carries the order as
@@ -4363,7 +4493,7 @@ mod tests {
         let client = history_test_client(Arc::new(RwLock::new(page)), None).await;
         cache_test_futures_instrument(&client);
 
-        let (reports, complete) = client
+        let (reports, coverage) = client
             .request_order_status_reports_checked(
                 AccountId::from("KRAKEN-001"),
                 None,
@@ -4374,7 +4504,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(complete);
+        assert!(coverage.is_complete());
         assert_eq!(reports.len(), 1, "{reports:?}");
         assert_eq!(reports[0].venue_order_id, VenueOrderId::from("H-CLOSED"));
         assert_eq!(reports[0].order_status, OrderStatus::Canceled);
@@ -4393,24 +4523,24 @@ mod tests {
 
         // Control: the same page with a decodable type reads complete, so the flag below is
         // driven by the undecodable type rather than by the page itself.
-        let (control, complete) = client
+        let (control, coverage) = client
             .request_order_status_reports_checked(account_id, None, None, None, false)
             .await
             .unwrap();
         assert!(
-            complete,
+            coverage.is_complete(),
             "the control must be complete, or the skip proves nothing"
         );
         assert_eq!(control.len(), 2);
 
         *history.write() = history_page("Unknown", None);
-        let (reports, complete) = client
+        let (reports, coverage) = client
             .request_order_status_reports_checked(account_id, None, None, None, false)
             .await
             .unwrap();
 
         assert!(
-            !complete,
+            !coverage.is_complete(),
             "a skipped history row must leave the set incomplete"
         );
         assert_eq!(reports.len(), 1);
@@ -4424,6 +4554,58 @@ mod tests {
         assert_eq!(report.quantity, Quantity::from("2"));
         assert_eq!(report.filled_qty, Quantity::from("0.5"));
         assert_eq!(report.price, Some(Price::from("69500")));
+    }
+
+    /// The order history request asks for the newest events first rather than relying on the
+    /// venue default, since a page with a continuation token is read as reaching back to its
+    /// oldest event.
+    #[rstest]
+    #[tokio::test]
+    async fn test_get_order_events_asks_for_the_newest_events_first() {
+        use axum::{Router, extract::RawQuery, routing::any};
+
+        let query: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
+        let recorded = query.clone();
+        let app = Router::new().route(
+            "/api/history/v3/orders",
+            any(move |RawQuery(raw): RawQuery| {
+                let recorded = recorded.clone();
+                async move {
+                    *recorded.write() = raw;
+                    r#"{"elements":[]}"#
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = KrakenFuturesHttpClient::with_credentials(
+            "test".to_string(),
+            "test".to_string(),
+            KrakenEnvironment::Live,
+            Some(format!("http://{addr}")),
+            10,
+            None,
+            None,
+            None,
+            None,
+            10,
+        )
+        .unwrap();
+
+        client
+            .inner
+            .get_order_events(None, None, None)
+            .await
+            .unwrap();
+
+        let query = query.read().clone().unwrap_or_default();
+        assert!(
+            query.split('&').any(|param| param == "sort=desc"),
+            "{query}"
+        );
     }
 
     fn cache_test_futures_instrument(client: &KrakenFuturesHttpClient) -> InstrumentId {

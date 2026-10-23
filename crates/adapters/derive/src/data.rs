@@ -16,6 +16,7 @@
 //! Live market data client implementation for the Derive adapter.
 
 use std::{
+    borrow::Cow,
     num::NonZeroUsize,
     str::FromStr,
     sync::{
@@ -32,7 +33,11 @@ use dashmap::DashMap;
 use nautilus_common::{
     cache::{InstrumentLookupError, fifo::FifoCache, quote::QuoteCache},
     clients::DataClient,
-    live::{runner::get_data_event_sender, sender::EventSender},
+    live::{
+        dst::time::{self, Instant},
+        runner::get_data_event_sender,
+        sender::EventSender,
+    },
     messages::{
         DataEvent,
         data::{
@@ -63,13 +68,14 @@ use nautilus_model::{
     enums::{AggregationSource, BookType, PriceType},
     identifiers::{ClientId, InstrumentId, TradeId, Venue},
     instruments::{Instrument, InstrumentAny},
-    types::{Price, Quantity},
+    types::Price,
 };
 use parking_lot::Mutex;
 use rust_decimal::Decimal;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    book::{recovery::spawn_recovery, sync::BookSyncTracker},
     common::{
         consts::{
             DERIVE_CANDLES_DEFAULT_LIMIT, DERIVE_CANDLES_MAX_PAGES, DERIVE_TRADES_PAGE_SIZE,
@@ -124,6 +130,7 @@ pub struct DeriveDataClient {
     active_greeks_subs: Arc<AtomicSet<InstrumentId>>,
     channel_subscriptions: Arc<ChannelSubscriptionRegistry>,
     subscription_lock: Arc<Mutex<()>>,
+    book_sync: BookSyncTracker,
     quote_cache: Arc<Mutex<QuoteCache>>,
     trades_emitted: Arc<Mutex<FifoCache<TradeId, TRADE_DEDUP_CAPACITY>>>,
     clock: &'static AtomicTime,
@@ -154,11 +161,16 @@ impl DeriveDataClient {
             config.currencies.clone(),
             config.include_expired,
         );
+        let book_sync = BookSyncTracker::default();
         let mut ws_client = DeriveWebSocketClient::new(
             Some(config.ws_url()),
             config.environment,
             config.transport_backend,
             proxy_url,
+        )
+        .with_book_sync(
+            book_sync.clone(),
+            Duration::from_secs(config.book_snapshot_timeout_secs),
         )
         .with_socket_control(SocketControl::new(
             client_id,
@@ -197,6 +209,7 @@ impl DeriveDataClient {
             active_greeks_subs: Arc::new(AtomicSet::new()),
             channel_subscriptions: Arc::new(ChannelSubscriptionRegistry::default()),
             subscription_lock: Arc::new(Mutex::new(())),
+            book_sync,
             quote_cache: Arc::new(Mutex::new(QuoteCache::new())),
             trades_emitted: Arc::new(Mutex::new(FifoCache::new())),
             clock,
@@ -205,13 +218,16 @@ impl DeriveDataClient {
 
     /// Spawns a fire-and-forget task, tracks its handle in `pending_tasks`
     /// for teardown abort, and logs failures with the task description.
-    fn spawn_task<F>(&self, description: &'static str, fut: F)
+    fn spawn_task<F>(&self, description: impl Into<Cow<'static, str>>, fut: F)
     where
         F: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
     {
+        let description = description.into();
+        let task_description = description.clone();
+
         let future = async move {
-            if let Err(e) = fut.await {
-                log::warn!("{description} failed: {e:?}");
+            if fut.await.is_err() {
+                log::warn!("{task_description} failed");
             }
         };
 
@@ -236,6 +252,7 @@ impl DeriveDataClient {
     fn clear_subscription_state(&self) {
         let _guard = self.subscription_lock.lock();
         self.channel_subscriptions.clear();
+        self.book_sync.clear();
         self.active_book_delta_channels.store(AHashMap::new());
         self.active_book_depth_channels.store(AHashMap::new());
         self.active_ticker_channels.store(AHashMap::new());
@@ -298,6 +315,7 @@ impl DeriveDataClient {
             active_funding_subs: Arc::clone(&self.active_funding_subs),
             active_greeks_subs: Arc::clone(&self.active_greeks_subs),
             subscription_lock: Arc::clone(&self.subscription_lock),
+            book_sync: self.book_sync.clone(),
             quote_cache: Arc::clone(&self.quote_cache),
             trades_emitted: Arc::clone(&self.trades_emitted),
         };
@@ -340,6 +358,44 @@ impl DeriveDataClient {
         Ok(())
     }
 
+    fn spawn_book_monitor(&self) -> anyhow::Result<()> {
+        let tracker = self.book_sync.clone();
+        let ws = self.ws_handle();
+        let registry = Arc::clone(&self.channel_subscriptions);
+        let stale_timeout = Duration::from_secs(self.config.book_stale_threshold_secs);
+        let snapshot_timeout = Duration::from_secs(self.config.book_snapshot_timeout_secs);
+        let tasks = self.pending_tasks.spawner()?;
+        let cancellation = self.cancellation_token.clone();
+
+        self.session_tasks.spawn(async move {
+            let mut interval = time::interval(Duration::from_secs(1));
+
+            loop {
+                tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => break,
+                    _ = interval.tick() => {
+                        for (channel, signal, recovery) in tracker.recoveries(stale_timeout, Instant::now()) {
+                            signal.log();
+                            let transition = registry.transition(&channel);
+                            spawn_recovery(
+                                channel,
+                                signal.instrument_id,
+                                recovery,
+                                ws.clone(),
+                                transition,
+                                snapshot_timeout,
+                                &tasks,
+                            );
+                        }
+                    }
+                }
+            }
+        })?;
+
+        Ok(())
+    }
+
     fn handle_ws_message(message: DeriveWsMessage, ctx: &WsMessageContext) {
         match message {
             DeriveWsMessage::Subscription(payload) => match parse_public_ws_data(&payload) {
@@ -355,13 +411,38 @@ impl DeriveDataClient {
                     );
                 }
             },
+            DeriveWsMessage::BookSubscription {
+                payload,
+                generation,
+            } => {
+                let _guard = ctx.subscription_lock.lock();
+
+                if generation.is_cancelled() {
+                    return;
+                }
+
+                match parse_public_ws_data(&payload) {
+                    Ok(DerivePublicWsData::Orderbook(msg)) => {
+                        Self::handle_public_book(&msg, ctx, Some(&generation));
+                    }
+                    Err(e) => {
+                        ctx.book_sync.reject_snapshot(
+                            payload.channel.as_str(),
+                            Arc::new(DeriveWsError::Transport(e.to_string())),
+                            Some(&generation),
+                        );
+                        log::warn!("Failed to parse Derive book snapshot: {e}");
+                    }
+                    Ok(_) => {}
+                }
+            }
             DeriveWsMessage::Reconnected => {
                 let _guard = ctx.subscription_lock.lock();
                 ctx.quote_cache.lock().clear();
                 log::info!("Derive WebSocket reconnected");
             }
-            DeriveWsMessage::SessionRecoveryFailed(reason) => {
-                log::error!("Derive WebSocket session recovery failed: {reason}");
+            DeriveWsMessage::SessionRecoveryFailed(_) => {
+                log::error!("Derive WebSocket session recovery failed");
             }
             DeriveWsMessage::Authenticated => log::debug!("Derive WebSocket authenticated"),
         }
@@ -372,13 +453,17 @@ impl DeriveDataClient {
         // generation cannot change during cache mutation.
         let _guard = ctx.subscription_lock.lock();
         match data {
-            DerivePublicWsData::Orderbook(msg) => Self::handle_public_book(&msg, ctx),
+            DerivePublicWsData::Orderbook(msg) => Self::handle_public_book(&msg, ctx, None),
             DerivePublicWsData::Trades(msg) => Self::handle_public_trades(&msg, ctx),
             DerivePublicWsData::Ticker(msg) => Self::handle_public_ticker(&msg, ctx),
         }
     }
 
-    fn handle_public_book(msg: &DeriveOrderbookMsg, ctx: &WsMessageContext) {
+    fn handle_public_book(
+        msg: &DeriveOrderbookMsg,
+        ctx: &WsMessageContext,
+        generation: Option<&CancellationToken>,
+    ) {
         let instrument_id = match msg.data.instrument_id() {
             Ok(instrument_id) => instrument_id,
             Err(e) => {
@@ -404,32 +489,65 @@ impl DeriveDataClient {
 
         let ts_init = ctx.clock.get_time_ns();
 
-        if deltas_active {
+        let deltas = if deltas_active {
             match parse_orderbook_deltas(
                 msg,
                 instrument.price_precision(),
                 instrument.size_precision(),
                 ts_init,
             ) {
-                Ok(deltas) => {
-                    Self::send_data(ctx, Data::BookDeltas(Box::new(deltas)));
-                }
-                Err(e) => log::warn!("Failed to parse Derive orderbook deltas: {e}"),
-            }
-        }
+                Ok(deltas) => Some(deltas),
+                Err(e) => {
+                    ctx.book_sync.reject_snapshot(
+                        channel,
+                        Arc::new(DeriveWsError::Transport(e.to_string())),
+                        generation,
+                    );
 
-        if depth_active {
+                    log::warn!("Failed to parse Derive book deltas: {e}");
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
+        let depth = if depth_active {
             match parse_orderbook_depth(
                 msg,
                 instrument.price_precision(),
                 instrument.size_precision(),
                 ts_init,
             ) {
-                Ok(depth) => {
-                    Self::send_data(ctx, Data::BookDepth(Box::new(depth)));
+                Ok(depth) => Some(depth),
+                Err(e) => {
+                    ctx.book_sync.reject_snapshot(
+                        channel,
+                        Arc::new(DeriveWsError::Transport(e.to_string())),
+                        generation,
+                    );
+
+                    log::warn!("Failed to parse Derive book depth: {e}");
+                    return;
                 }
-                Err(e) => log::warn!("Failed to parse Derive orderbook depth: {e}"),
             }
+        } else {
+            None
+        };
+
+        if !ctx
+            .book_sync
+            .record_snapshot(channel, msg.data.timestamp, generation, Instant::now())
+        {
+            return;
+        }
+
+        if let Some(deltas) = deltas {
+            Self::send_data(ctx, Data::BookDeltas(Box::new(deltas)));
+        }
+
+        if let Some(depth) = depth {
+            Self::send_data(ctx, Data::BookDepth(Box::new(depth)));
         }
     }
 
@@ -662,7 +780,9 @@ impl DeriveDataClient {
         SubscriptionLifecycle {
             registry: Arc::clone(&self.channel_subscriptions),
             lock: Arc::clone(&self.subscription_lock),
+            snapshot_timeout: Duration::from_secs(self.config.book_snapshot_timeout_secs),
             dispatch: SubscriptionDispatchState {
+                book_sync: self.book_sync.clone(),
                 active_book_delta_channels: Arc::clone(&self.active_book_delta_channels),
                 active_book_depth_channels: Arc::clone(&self.active_book_depth_channels),
                 active_ticker_channels: Arc::clone(&self.active_ticker_channels),
@@ -781,6 +901,7 @@ impl DataClient for DeriveDataClient {
         self.cancellation_token.cancel();
         self.abort_session_tasks();
         self.abort_pending_tasks();
+        self.book_sync.clear();
         self.is_connected.store(false, Ordering::Relaxed);
         Ok(())
     }
@@ -864,7 +985,8 @@ impl DataClient for DeriveDataClient {
             .ws_client
             .take_event_receiver()
             .ok_or_else(|| anyhow::anyhow!("Derive WebSocket event receiver not initialized"))
-            .and_then(|rx| self.spawn_stream_task(rx));
+            .and_then(|rx| self.spawn_stream_task(rx))
+            .and_then(|()| self.spawn_book_monitor());
 
         if let Err(e) = session_result {
             if let Err(teardown_error) = self.teardown_partial_connect().await {
@@ -1168,7 +1290,7 @@ impl DataClient for DeriveDataClient {
         let start_nanos = datetime_to_unix_nanos(request.start);
         let end_nanos = datetime_to_unix_nanos(request.end);
 
-        self.spawn_task("request_quotes", async move {
+        self.spawn_task(format!("request_quotes {instrument_id}"), async move {
             let ticker = match http_client.get_ticker(&venue_symbol).await {
                 Ok(ticker) => ticker,
                 Err(e) => {
@@ -1859,6 +1981,7 @@ struct RemovedSubscription {
 
 #[derive(Debug, Clone)]
 struct SubscriptionDispatchState {
+    book_sync: BookSyncTracker,
     active_book_delta_channels: Arc<AtomicMap<InstrumentId, String>>,
     active_book_depth_channels: Arc<AtomicMap<InstrumentId, String>>,
     active_ticker_channels: Arc<AtomicMap<InstrumentId, String>>,
@@ -1873,6 +1996,7 @@ struct SubscriptionDispatchState {
 
 #[derive(Debug, Clone)]
 struct SubscriptionLifecycle {
+    snapshot_timeout: Duration,
     registry: Arc<ChannelSubscriptionRegistry>,
     lock: Arc<Mutex<()>>,
     dispatch: SubscriptionDispatchState,
@@ -1909,19 +2033,39 @@ async fn run_channel_subscribe(
     let transition = lifecycle.registry.transition(&channel);
     let _guard = transition.lock().await;
 
-    if !lifecycle.is_current_channel(owner, generation, &channel) || ws.has_subscription(&channel) {
+    if !lifecycle.is_current_channel(owner, generation, &channel) {
         return Ok(());
     }
 
-    if let Err(e) = request.subscribe(&ws).await {
+    let book_pending = lifecycle
+        .dispatch
+        .book_sync
+        .write(&channel)
+        .is_some_and(|write| write.gate.lock().is_closed());
+
+    if ws.has_subscription(&channel) && !book_pending {
+        return Ok(());
+    }
+
+    let result = if matches!(&request, ChannelRequest::Orderbook { .. }) {
+        ws.subscribe_book_gated(channel.clone()).await
+    } else {
+        request.subscribe(&ws).await
+    };
+
+    if let Err(e) = result {
         lifecycle.rollback(owner, generation);
-        log::error!("Failed to subscribe to Derive channel `{channel}`: {e}");
+        log::error!(
+            "Failed to subscribe to Derive channel `{channel}`: {}",
+            e.redacted_message()
+        );
 
         let cleanup_error = match request.unsubscribe(&ws).await {
             Ok(()) => None,
             Err(cleanup_error) => {
                 log::error!(
-                    "Failed to clean up uncertain Derive channel `{channel}`: {cleanup_error}",
+                    "Failed to clean up uncertain Derive channel `{channel}`: {}",
+                    cleanup_error.redacted_message(),
                 );
                 Some(cleanup_error)
             }
@@ -1941,6 +2085,10 @@ async fn run_channel_subscribe(
         return Ok(());
     }
 
+    lifecycle
+        .dispatch
+        .book_sync
+        .subscription_written(&channel, lifecycle.snapshot_timeout);
     if !lifecycle.has_owners(&channel)
         && let Err(e) = request.unsubscribe(&ws).await
     {
@@ -1983,6 +2131,15 @@ impl SubscriptionLifecycle {
         let mut state = self.registry.state.lock();
         let generation = state.activate(owner, channel)?;
         self.dispatch.activate(owner, channel);
+
+        if let ChannelOwner::BookDeltas(instrument_id) | ChannelOwner::BookDepth(instrument_id) =
+            owner
+        {
+            self.dispatch
+                .book_sync
+                .record_subscription(channel.expect("book channel present"), instrument_id);
+        }
+
         Some(generation)
     }
 
@@ -2016,6 +2173,12 @@ impl SubscriptionLifecycle {
         };
 
         self.dispatch.deactivate(owner, removed.channel_empty);
+        if removed.channel_empty
+            && let Some(channel) = &removed.channel
+        {
+            self.dispatch.book_sync.remove(channel);
+        }
+
         true
     }
 
@@ -2024,6 +2187,12 @@ impl SubscriptionLifecycle {
         let mut state = self.registry.state.lock();
         let removed = state.remove(owner)?;
         self.dispatch.deactivate(owner, removed.channel_empty);
+        if removed.channel_empty
+            && let Some(channel) = &removed.channel
+        {
+            self.dispatch.book_sync.remove(channel);
+        }
+
         Some(removed)
     }
 
@@ -2395,35 +2564,23 @@ fn process_ticker_quote(
     quote_cache: &mut QuoteCache,
 ) -> anyhow::Result<Option<QuoteTick>> {
     let quote = parse_ticker_quote(msg, price_precision, size_precision, ts_init)?;
-    let (bid_price, bid_size) = quote_side(quote.bid_price, quote.bid_size);
-    let (ask_price, ask_size) = quote_side(quote.ask_price, quote.ask_size);
+    if quote.bid_price.is_zero()
+        || quote.ask_price.is_zero()
+        || quote.bid_size.is_zero()
+        || quote.ask_size.is_zero()
+    {
+        // Tickers are complete snapshots; a zero side withdraws cached liquidity
+        quote_cache.remove(&quote.instrument_id);
 
-    match quote_cache.process(
-        quote.instrument_id,
-        bid_price,
-        ask_price,
-        bid_size,
-        ask_size,
-        quote.ts_event,
-        quote.ts_init,
-    ) {
-        Ok(quote) => Ok(Some(quote)),
-        Err(e) => {
-            log::debug!(
-                "Skipping partial Derive ticker quote for {}: {e}",
-                msg.data.instrument_name(),
-            );
-            Ok(None)
-        }
+        log::debug!(
+            "Skipping Derive ticker quote with an empty side for {}",
+            msg.data.instrument_name(),
+        );
+        return Ok(None);
     }
-}
 
-fn quote_side(price: Price, size: Quantity) -> (Option<Price>, Option<Quantity>) {
-    if price.is_zero() || size.is_zero() {
-        (None, None)
-    } else {
-        (Some(price), Some(size))
-    }
+    quote_cache.insert(quote.instrument_id, quote);
+    Ok(Some(quote))
 }
 
 fn channel_is_active(
@@ -2584,16 +2741,20 @@ mod tests {
         identifiers::InstrumentId,
         types::{Price, Quantity},
     };
+    use nautilus_network::websocket::TransportBackend;
     use rstest::rstest;
+    use rust_decimal_macros::dec;
     use serde_json::{Value, json};
 
     use super::*;
     use crate::{
+        client_logging,
         common::{
             consts::DERIVE_CLIENT_ID, enums::DeriveEnvironment, parse::parse_derive_instrument_any,
+            urls,
         },
         http::models::DeriveInstrument,
-        websocket::{DeriveWsFrame, WsSubscriptionPayload},
+        websocket::{DeriveWsFrame, WsSubscriptionPayload, parse_orderbook_msg, parse_ticker_msg},
     };
 
     fn data_path() -> PathBuf {
@@ -2604,6 +2765,62 @@ mod tests {
         let content = std::fs::read_to_string(data_path().join(filename))
             .unwrap_or_else(|_| panic!("failed to read {filename}"));
         serde_json::from_str(&content).expect("invalid json")
+    }
+
+    #[tokio::test]
+    async fn test_data_task_log_omits_provider_error() {
+        let _capture = client_logging::capture_logs().await;
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        replace_data_event_sender(sender);
+        let client =
+            DeriveDataClient::new(*DERIVE_CLIENT_ID, DeriveDataClientConfig::default()).unwrap();
+        client.spawn_task("Synthetic subscription", async {
+            anyhow::bail!("SYN-secret-provider-error")
+        });
+
+        wait_until_async(
+            || async {
+                client_logging::messages().iter().any(|(level, message)| {
+                    *level == log::Level::Warn && message == "Synthetic subscription failed"
+                })
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+
+        client.join_pending_tasks().await.unwrap();
+        let messages = client_logging::messages();
+        assert!(messages.contains(&(
+            log::Level::Warn,
+            "Synthetic subscription failed".to_string()
+        )));
+        assert!(
+            !messages
+                .iter()
+                .any(|(_, message)| message.contains("SYN-secret"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_session_failure_log_omits_provider_reason() {
+        let _capture = client_logging::capture_logs().await;
+        let (ctx, _receiver) = make_ctx(None);
+        DeriveDataClient::handle_ws_message(
+            DeriveWsMessage::SessionRecoveryFailed("SYN-secret-provider-reason".to_string()),
+            &ctx,
+        );
+        assert_eq!(
+            client_logging::messages()
+                .into_iter()
+                .filter(|(_, message)| {
+                    message.starts_with("Derive WebSocket session recovery failed")
+                })
+                .collect::<Vec<_>>(),
+            vec![(
+                log::Level::Error,
+                "Derive WebSocket session recovery failed".to_string()
+            )]
+        );
     }
 
     #[tokio::test]
@@ -2708,6 +2925,17 @@ mod tests {
                 active_funding_subs: Arc::new(AtomicSet::new()),
                 active_greeks_subs: Arc::new(AtomicSet::new()),
                 subscription_lock: Arc::new(Mutex::new(())),
+                book_sync: {
+                    let tracker = BookSyncTracker::default();
+                    let id = InstrumentId::from("ETH-PERP.DERIVE");
+                    tracker.record_subscription("orderbook.ETH-PERP.1.10", id);
+                    tracker
+                        .write("orderbook.ETH-PERP.1.10")
+                        .unwrap()
+                        .gate
+                        .open();
+                    tracker
+                },
                 quote_cache: Arc::new(Mutex::new(QuoteCache::new())),
                 trades_emitted: Arc::new(Mutex::new(FifoCache::new())),
             },
@@ -2827,7 +3055,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_handle_ticker_partial_quote_uses_cached_side() {
+    fn test_handle_ticker_empty_side_clears_cached_quote() {
         let instrument = spot_instrument();
         let instrument_id = instrument.id();
         let channel = "ticker_slim.ETH-USDC.1000";
@@ -2849,16 +3077,210 @@ mod tests {
 
         DeriveDataClient::handle_ws_message(DeriveWsMessage::Subscription(payload), &ctx);
 
-        match rx.try_recv().unwrap() {
-            DataEvent::Data(Data::Quote(quote)) => {
-                assert_eq!(quote.instrument_id, instrument_id);
-                assert_eq!(quote.bid_price, Price::from("0.2"));
-                assert_eq!(quote.ask_price, Price::from("0.3"));
-                assert_eq!(quote.bid_size, Quantity::from("45.00"));
-                assert_eq!(quote.ask_size, Quantity::from("20.00"));
-            }
-            other => panic!("expected quote data event, was {other:?}"),
+        assert!(rx.try_recv().is_err());
+        assert_eq!(ctx.quote_cache.lock().get(&instrument_id), None);
+    }
+
+    #[rstest]
+    #[case::bid_price("0", "0.4", "45", "67")]
+    #[case::bid_size("0.2", "0.4", "0", "67")]
+    #[case::ask_price("0.2", "0", "45", "67")]
+    #[case::ask_size("0.2", "0.4", "45", "0")]
+    #[case::both_empty("0", "0", "0", "0")]
+    fn test_process_ticker_empty_sides_and_recovery(
+        #[case] bid_price: &str,
+        #[case] ask_price: &str,
+        #[case] bid_size: &str,
+        #[case] ask_size: &str,
+        #[values(false, true)] populated: bool,
+        #[values(false, true)] slim: bool,
+    ) {
+        let (instrument, channel, mut data) = if slim {
+            (
+                spot_instrument(),
+                "ticker_slim.ETH-USDC.1000",
+                spot_ticker_slim_json(),
+            )
+        } else {
+            (perp_instrument(), "ticker.ETH-PERP.1000", ticker_json(1234))
+        };
+
+        let instrument_id = instrument.id();
+        let mut quote_cache = QuoteCache::new();
+        let ts_init = UnixNanos::from(9_876_543_210);
+
+        let expected = QuoteTick::new(
+            instrument_id,
+            Price::from_decimal_dp(dec!(0.2), instrument.price_precision()).unwrap(),
+            Price::from_decimal_dp(dec!(0.4), instrument.price_precision()).unwrap(),
+            Quantity::from_decimal_dp(dec!(45), instrument.size_precision()).unwrap(),
+            Quantity::from_decimal_dp(dec!(67), instrument.size_precision()).unwrap(),
+            UnixNanos::from(1_238_000_000),
+            ts_init,
+        );
+
+        let unrelated_quote = QuoteTick {
+            instrument_id: InstrumentId::from("BTC-PERP.DERIVE"),
+            ..expected
+        };
+
+        quote_cache.insert(unrelated_quote.instrument_id, unrelated_quote);
+        if populated {
+            quote_cache.insert(instrument_id, expected);
         }
+
+        let keys = if slim {
+            ["b", "a", "B", "A"]
+        } else {
+            [
+                "best_bid_price",
+                "best_ask_price",
+                "best_bid_amount",
+                "best_ask_amount",
+            ]
+        };
+
+        for (values, timestamp, expected_result) in [
+            ([bid_price, ask_price, bid_size, ask_size], 1235, None),
+            (["0.6", "0", "89", "0"], 1236, None),
+            (["0", "0.8", "0", "91"], 1237, None),
+            (["0.2", "0.4", "45", "67"], 1238, Some(expected)),
+        ] {
+            data["timestamp"] = json!(timestamp);
+            let snapshot = if slim {
+                &mut data["instrument_ticker"]
+            } else {
+                &mut data
+            };
+
+            for (key, value) in keys.into_iter().zip(values) {
+                snapshot[key] = json!(value);
+            }
+
+            let payload = subscription_payload(channel, &data);
+            let msg = parse_ticker_msg(&payload).unwrap();
+            let result = process_ticker_quote(
+                &msg,
+                instrument.price_precision(),
+                instrument.size_precision(),
+                ts_init,
+                &mut quote_cache,
+            )
+            .unwrap();
+
+            assert_eq!(result, expected_result);
+            assert_eq!(quote_cache.get(&instrument_id), expected_result.as_ref());
+            assert_eq!(
+                quote_cache.get(&unrelated_quote.instrument_id),
+                Some(&unrelated_quote)
+            );
+        }
+    }
+
+    #[rstest]
+    #[case::testnet_spot(DeriveEnvironment::Testnet, "ETH-USDC")]
+    #[case::testnet_perp(DeriveEnvironment::Testnet, "ETH-PERP")]
+    #[case::mainnet_spot(DeriveEnvironment::Mainnet, "ETH-USDC")]
+    #[case::mainnet_perp(DeriveEnvironment::Mainnet, "ETH-PERP")]
+    #[tokio::test]
+    #[ignore = "requires Derive public network access; mainnet requires an isolated NZ route"]
+    async fn test_live_ticker_complete_snapshots(
+        #[case] environment: DeriveEnvironment,
+        #[case] instrument_name: &str,
+    ) {
+        let http =
+            DeriveHttpClient::new(urls::rest_url(environment), Some(15), None, None).unwrap();
+        let definition = http.get_instrument(instrument_name).await.unwrap();
+        let instrument = parse_derive_instrument_any(&definition, UnixNanos::from(1))
+            .unwrap()
+            .unwrap();
+        let instrument_id = instrument.id();
+        let mut ws_client =
+            DeriveWebSocketClient::new(None, environment, TransportBackend::default(), None);
+        ws_client.connect().await.unwrap();
+        let mut events = ws_client.take_event_receiver().unwrap();
+        let validation = async {
+            ws_client
+                .subscribe_ticker(instrument_name, "1000")
+                .await
+                .unwrap();
+            let mut quote_cache = QuoteCache::new();
+
+            let seed = QuoteTick::new(
+                instrument_id,
+                Price::from("0.1"),
+                Price::from("0.3"),
+                Quantity::from("10.00"),
+                Quantity::from("20.00"),
+                UnixNanos::from(1),
+                UnixNanos::from(1),
+            );
+            quote_cache.insert(instrument_id, seed);
+            let mut published = 0;
+            let mut suppressed = 0;
+
+            for _ in 0..3 {
+                let payload = loop {
+                    if let DeriveWsMessage::Subscription(payload) = events.recv().await.unwrap() {
+                        break payload;
+                    }
+                };
+
+                let msg = parse_ticker_msg(&payload).unwrap();
+                let ts_init = UnixNanos::from(9_876_543_210);
+                let expected = parse_ticker_quote(
+                    &msg,
+                    instrument.price_precision(),
+                    instrument.size_precision(),
+                    ts_init,
+                )
+                .unwrap();
+                let result = process_ticker_quote(
+                    &msg,
+                    instrument.price_precision(),
+                    instrument.size_precision(),
+                    ts_init,
+                    &mut quote_cache,
+                )
+                .unwrap();
+
+                if expected.bid_price.is_zero()
+                    || expected.ask_price.is_zero()
+                    || expected.bid_size.is_zero()
+                    || expected.ask_size.is_zero()
+                {
+                    assert_eq!(result, None);
+                    assert_eq!(quote_cache.get(&instrument_id), None);
+                    suppressed += 1;
+                } else {
+                    assert_eq!(result, Some(expected));
+                    assert_eq!(quote_cache.get(&instrument_id), Some(&expected));
+                    assert_eq!(expected.instrument_id, instrument_id);
+                    assert_eq!(
+                        expected.ts_event,
+                        UnixNanos::from(msg.data.timestamp() as u64 * 1_000_000)
+                    );
+                    assert_eq!(expected.ts_init, ts_init);
+                    published += 1;
+                }
+            }
+
+            ws_client
+                .unsubscribe_ticker(instrument_name, "1000")
+                .await
+                .unwrap();
+            (published, suppressed)
+        };
+
+        let result = tokio::time::timeout(Duration::from_secs(30), validation).await;
+        tokio::time::timeout(Duration::from_secs(5), ws_client.disconnect())
+            .await
+            .expect("ticker validation shutdown exceeds five seconds")
+            .unwrap();
+        let (published, suppressed) = result.expect("ticker validation exceeds 30 seconds");
+        println!(
+            "Derive {environment:?} {instrument_name}: {published} complete quotes, {suppressed} empty snapshots suppressed; unsubscribed and disconnected"
+        );
     }
 
     #[rstest]
@@ -2882,6 +3304,9 @@ mod tests {
         ctx.active_quote_subs.insert(instrument_id);
 
         DeriveDataClient::handle_ws_message(DeriveWsMessage::Reconnected, &ctx);
+
+        assert_eq!(ctx.quote_cache.lock().get(&instrument_id), None);
+
         let payload = subscription_payload(channel, &spot_ticker_slim_json());
         DeriveDataClient::handle_ws_message(DeriveWsMessage::Subscription(payload), &ctx);
 
@@ -2891,6 +3316,7 @@ mod tests {
     #[rstest]
     #[tokio::test]
     async fn test_session_recovery_failure_marks_client_disconnected() {
+        let _capture = client_logging::capture_logs().await;
         let (data_tx, _data_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
         replace_data_event_sender(data_tx);
 
@@ -2914,6 +3340,7 @@ mod tests {
         assert!(!client.is_connected());
 
         client.cancellation_token.cancel();
+        client.join_session_tasks().await.unwrap();
     }
 
     #[rstest]
@@ -2961,6 +3388,120 @@ mod tests {
             }
             other => panic!("expected depth data event, was {other:?}"),
         }
+    }
+
+    #[rstest]
+    #[case::null_price(0, Value::Null)]
+    #[case::empty_price(0, json!(""))]
+    #[case::null_amount(1, Value::Null)]
+    #[case::empty_amount(1, json!(""))]
+    fn test_orderbook_missing_numeric_values_preserve_recovery_and_watermark(
+        #[case] field: usize,
+        #[case] value: Value,
+        #[values("bids", "asks")] side: &str,
+        #[values(false, true)] depth: bool,
+    ) {
+        let instrument = perp_instrument();
+        let instrument_id = instrument.id();
+        let price_precision = instrument.price_precision();
+        let size_precision = instrument.size_precision();
+        let (ctx, mut rx) = make_ctx(Some(instrument));
+        let channel = "orderbook.ETH-PERP.1.10";
+
+        let channels = if depth {
+            &ctx.active_book_depth_channels
+        } else {
+            &ctx.active_book_delta_channels
+        };
+
+        channels.insert(instrument_id, channel.to_string());
+
+        let assert_snapshot = |event, msg: &DeriveOrderbookMsg| match event {
+            DataEvent::Data(Data::BookDeltas(deltas)) if !depth => {
+                let expected =
+                    parse_orderbook_deltas(msg, price_precision, size_precision, deltas.ts_init)
+                        .unwrap();
+                assert_eq!(*deltas, expected);
+            }
+            DataEvent::Data(Data::BookDepth(snapshot)) if depth => {
+                let expected =
+                    parse_orderbook_depth(msg, price_precision, size_precision, snapshot.ts_init)
+                        .unwrap();
+                assert_eq!(*snapshot, expected);
+            }
+            other => panic!("expected book data event, was {other:?}"),
+        };
+
+        let initial = orderbook_json();
+        let timestamp = initial["timestamp"].as_i64().unwrap();
+        let write = ctx.book_sync.write(channel).unwrap();
+        let payload = subscription_payload(channel, &initial);
+        let msg = parse_orderbook_msg(&payload).unwrap();
+        DeriveDataClient::handle_ws_message(
+            DeriveWsMessage::BookSubscription {
+                payload,
+                generation: write.generation.clone(),
+            },
+            &ctx,
+        );
+
+        assert_snapshot(rx.try_recv().unwrap(), &msg);
+
+        let mut malformed = initial.clone();
+        malformed["timestamp"] = json!(timestamp + 2);
+        malformed[side][0][field] = value;
+        let payload = subscription_payload(channel, &malformed);
+        DeriveDataClient::handle_ws_message(
+            DeriveWsMessage::BookSubscription {
+                payload,
+                generation: write.generation,
+            },
+            &ctx,
+        );
+
+        assert!(rx.try_recv().is_err());
+        let recoveries = ctx.book_sync.recoveries(Duration::ZERO, Instant::now());
+        assert_eq!(recoveries.len(), 1);
+        let recovery = &recoveries[0].2;
+        let write = ctx
+            .book_sync
+            .begin_recovery_write(channel, recovery, recovery.gate.clone())
+            .unwrap();
+        write.gate.open();
+        let payload = subscription_payload(channel, &malformed);
+        DeriveDataClient::handle_ws_message(
+            DeriveWsMessage::BookSubscription {
+                payload,
+                generation: write.generation.clone(),
+            },
+            &ctx,
+        );
+
+        assert!(rx.try_recv().is_err());
+        assert!(recovery.is_running());
+        assert!(!recovery.is_accepted());
+
+        let mut valid = initial;
+        valid["timestamp"] = json!(timestamp + 1);
+        let payload = subscription_payload(channel, &valid);
+        let msg = parse_orderbook_msg(&payload).unwrap();
+        DeriveDataClient::handle_ws_message(
+            DeriveWsMessage::BookSubscription {
+                payload,
+                generation: write.generation,
+            },
+            &ctx,
+        );
+
+        assert_snapshot(rx.try_recv().unwrap(), &msg);
+        assert!(recovery.is_accepted());
+        assert!(!recovery.is_running());
+        assert!(rx.try_recv().is_err());
+        assert!(
+            ctx.book_sync
+                .recoveries(Duration::ZERO, Instant::now())
+                .is_empty()
+        );
     }
 
     #[rstest]
